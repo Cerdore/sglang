@@ -118,9 +118,9 @@ class SamplingParams:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
-        if self.temperature < 0.0:
+        if not 0.0 <= self.temperature <= 2.0:
             raise ValueError(
-                f"temperature must be non-negative, got {self.temperature}."
+                f"temperature must be in [0, 2], got {self.temperature}."
             )
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")

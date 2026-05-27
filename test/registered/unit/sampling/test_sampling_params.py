@@ -90,6 +90,17 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
+    def test_temperature_above_two_raises(self):
+        """Test that verify() rejects temperature > 2.0 (OpenAI spec upper bound)."""
+        sp = self._make(temperature=2.1)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_temperature_at_two_is_valid(self):
+        """Test that temperature=2.0 (inclusive upper bound) is accepted."""
+        sp = self._make(temperature=2.0)
+        sp.verify(self.VOCAB_SIZE)
+
     # --- top_p ---
     def test_top_p_negative_raises(self):
         """Test that verify() rejects negative top_p (valid range is (0, 1])."""
