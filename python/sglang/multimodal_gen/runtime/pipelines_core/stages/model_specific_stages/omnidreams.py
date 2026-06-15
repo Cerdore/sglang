@@ -32,12 +32,17 @@ from collections import OrderedDict
 import PIL.Image
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
+    CUDAGraphWrapper,
+)
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import build_fp8_dit
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
     RotaryPositionEmbedding3D,
 )
@@ -54,6 +59,7 @@ from sglang.multimodal_gen.runtime.models.vision_utils import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -134,6 +140,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         tokenizer=None,
         vae=None,
         config=None,
+        vae_component_name: str = "vae",
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -142,6 +149,10 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         self.tokenizer = tokenizer
         self.vae = vae
         self.config = config
+        # Residency component key for the encode VAE: "vae" (Wan) by default, or
+        # "vae_encoder" when the P2 LightVAE encoder is swapped in (so the Wan
+        # VAE keeps the "vae" slot for the decode path).
+        self._vae_component_name = vae_component_name
         # Per-instance LRU cache: prompt string -> text embedding on CPU.
         self._text_embed_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
@@ -160,7 +171,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             ComponentUse(stage_name=stage_name, component_name="text_encoder"),
             ComponentUse(
                 stage_name=stage_name,
-                component_name="vae",
+                component_name=self._vae_component_name,
                 target_dtype=vae_dtype,
             ),
         ]
@@ -511,17 +522,30 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
 
         # --- text conditioning (100352) ---
         prompt = batch.prompt if isinstance(batch.prompt, str) else str(batch.prompt)
-        with self.use_declared_component(
-            component_name="text_encoder", module=self.text_encoder
-        ):
-            text_embeds = self._encode_text(prompt, device).to(dit_dtype)
+        # When the text encoder is CPU-offloaded, skip the residency manager's
+        # enter()/exit() — it would forcefully move the 14 GB Cosmos-Reason1-7B onto
+        # the GPU, which OOMs on cards < 16 GB (e.g. RTX 5070 12 GB).  Run directly
+        # on CPU instead; the single forward is fast enough for a 7B LM and the
+        # embedding is cached on CPU for reuse across requests.
+        _te_offloaded = getattr(server_args, "text_encoder_cpu_offload", False)
+        if _te_offloaded:
+            text_embeds = self._encode_text(prompt, torch.device("cpu")).to(
+                device=device, dtype=dit_dtype
+            )
+        else:
+            with self.use_declared_component(
+                component_name="text_encoder", module=self.text_encoder
+            ):
+                text_embeds = self._encode_text(prompt, device).to(dit_dtype)
         batch.prompt_embeds = [text_embeds]
         batch.negative_prompt_embeds = None
         batch.image_embeds = []
         batch.do_classifier_free_guidance = False
 
         # --- i2v reference latent -> patchified frame-0 token block ---
-        with self.use_declared_component(component_name="vae", module=self.vae):
+        with self.use_declared_component(
+            component_name=self._vae_component_name, module=self.vae
+        ):
             image_latent = self._encode_reference_image(
                 batch, device, vae_dtype, height, width
             )
@@ -548,7 +572,9 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         # --- AR rollout state for the denoising stage ---
         num_chunks = self._compute_num_chunks(batch, len_t)
         # Per-chunk HD-map tokens (None -> AR stage uses zeros / HDMap disabled).
-        with self.use_declared_component(component_name="vae", module=self.vae):
+        with self.use_declared_component(
+            component_name=self._vae_component_name, module=self.vae
+        ):
             hdmap_tokens = self._encode_hdmap(
                 batch, device, vae_dtype, dit_dtype, num_chunks, len_t, height, width
             )
@@ -801,6 +827,64 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # Loop-invariant context-noise timestep tensor (same scalar every chunk).
         ctx_noise_t = torch.tensor(context_noise, device=device, dtype=dit_dtype)
 
+        # P0: CUDA-graph capture of the steady-state DiT calls. The 3 calls per
+        # chunk (2 self-forcing denoise steps + 1 context re-forward) share
+        # identical tensor shapes once the KV window is steady, so a single
+        # captured graph replays for all of them. ``_dit_call`` binds the
+        # loop-invariant args (text/caches/cross_attn_kv/view_indices); the
+        # per-call-varying tensors (noisy, timestep, cond_mask, rope, hdmap) are
+        # passed positionally so the wrapper stages them into static buffers and
+        # copies them in per replay. Fill-phase chunks run eager because
+        # BlockKVCache.cached_k() returns a variable-length slice until the
+        # window is full (a graph captured then would bake the wrong shape).
+        use_cuda_graph = (
+            getattr(config, "enable_cuda_graph", False)
+            or envs.SGLANG_OMNIDREAMS_CUDA_GRAPH
+        ) and device.type == "cuda"
+
+        def _dit_call(hidden_states, timestep, cond_mask_t, rope_t, hdmap_t):
+            return self.transformer(
+                hidden_states=hidden_states,
+                encoder_hidden_states=text,
+                timestep=timestep,
+                condition_video_input_mask=cond_mask_t,
+                rope_freqs=rope_t,
+                hdmap_condition=hdmap_t,
+                kv_caches=caches,
+                cross_attn_kv=cross_attn_kv,
+                view_indices=view_indices,
+            )
+
+        cuda_graph_runner = (
+            CUDAGraphWrapper(
+                _dit_call,
+                warmup_iters=getattr(config, "cuda_graph_warmup_iters", 2),
+            )
+            if use_cuda_graph
+            else None
+        )
+
+        # P4a: native FP8 DiT (optimized_dit_forward). Mutually exclusive with
+        # the P0 CUDA graph (the native op manages its own graph). GPU/sm_120
+        # only -- build_fp8_dit returns None when the native ext is unavailable,
+        # so this transparently falls back to the eager (or P0) DiT.
+        fp8_dit = None
+        if getattr(config, "use_fp8_dit", False) or envs.SGLANG_OMNIDREAMS_FP8_DIT:
+            if cuda_graph_runner is not None:
+                logger.warning(
+                    "OmniDreams: use_fp8_dit overrides enable_cuda_graph (the "
+                    "native FP8 op manages its own CUDA graph)."
+                )
+                cuda_graph_runner = None
+            fp8_dit = build_fp8_dit(
+                self.transformer,
+                arch,
+                attention_backend=getattr(config, "fp8_dit_attention_backend", "auto"),
+                sparge_topk=getattr(config, "fp8_dit_sparge_topk", None),
+            )
+            if fp8_dit is None:
+                logger.info("OmniDreams: native FP8 DiT unavailable; using eager DiT.")
+
         latent_chunks: list[torch.Tensor] = []
         for chunk_idx in range(num_chunks):
             rope_freqs = rope.shift_t(chunk_idx)
@@ -816,23 +900,50 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 )
             pin = is_first and image_full is not None
 
-            def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-                if pin:
-                    noisy = noisy * (1.0 - inject_mask) + image_full * inject_mask
-                return self.transformer(
-                    hidden_states=noisy,
-                    encoder_hidden_states=text,
-                    timestep=t,
-                    condition_video_input_mask=cond_mask,
-                    rope_freqs=rope_freqs,
-                    hdmap_condition=hdmap_chunk,
-                    kv_caches=caches,
-                    cross_attn_kv=cross_attn_kv,
-                    view_indices=view_indices,
-                )
-
+            # Roll the per-block KV window BEFORE deciding capture eligibility:
+            # is_steady_state() then reflects whether this chunk reads a full
+            # (fixed-shape) window -- the P0 capture precondition. Once steady it
+            # stays steady, so the graph captured on the first steady chunk
+            # replays for every chunk after.
             for c in caches:
                 c.before_update(chunk_idx)
+            steady_now = (
+                cuda_graph_runner is not None and caches[0].is_steady_state()
+            )
+
+            def _call_dit(hidden_states, timestep):
+                if fp8_dit is not None:
+                    # P4a native FP8 path (owns its own KV write at write_start).
+                    return fp8_dit(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=text,
+                        timestep=timestep,
+                        condition_video_input_mask=cond_mask,
+                        rope_freqs=rope_freqs,
+                        hdmap_condition=hdmap_chunk,
+                        kv_caches=caches,
+                        cross_attn_kv=cross_attn_kv,
+                        view_indices=view_indices,
+                        ar_idx=chunk_idx,
+                        len_t=len_t,
+                        hp=hp,
+                        wp=wp,
+                    )
+                if steady_now:
+                    return cuda_graph_runner(
+                        hidden_states, timestep, cond_mask, rope_freqs, hdmap_chunk
+                    )
+                return _dit_call(
+                    hidden_states, timestep, cond_mask, rope_freqs, hdmap_chunk
+                )
+
+            def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+                # The first-frame ``pin`` injection stays EAGER (outside the
+                # captured graph) so ``image_full`` is not baked in. pin is only
+                # true on chunk 0, which is always fill-phase (eager) anyway.
+                if pin:
+                    noisy = noisy * (1.0 - inject_mask) + image_full * inject_mask
+                return _call_dit(noisy, t)
 
             noise = torch.empty(
                 B, chunk_tokens, in_d, device=device, dtype=dit_dtype
@@ -850,17 +961,9 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             )
             if pin:
                 ctx_latent = ctx_latent * (1.0 - inject_mask) + image_full * inject_mask
-            self.transformer(
-                hidden_states=ctx_latent,
-                encoder_hidden_states=text,
-                timestep=ctx_noise_t,
-                condition_video_input_mask=cond_mask,
-                rope_freqs=rope_freqs,
-                hdmap_condition=hdmap_chunk,
-                kv_caches=caches,
-                cross_attn_kv=cross_attn_kv,
-                view_indices=view_indices,
-            )
+            # Return ignored: this forward exists for its in-cache K/V write
+            # side effect (captured inside the graph at steady-state).
+            _call_dit(ctx_latent, ctx_noise_t)
 
             for c in caches:
                 c.after_update(chunk_idx)
@@ -924,3 +1027,26 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         result = VerificationResult()
         result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         return result
+
+
+class OmniDreamsLightTAEDecodingStage(DecodingStage):
+    """P1: single-pass decode via the LightTAE (TAEHV) tiny decoder.
+
+    Differs from the standard ``DecodingStage`` in two ways:
+
+    * ``scale_and_shift`` is a no-op. :class:`LightTAEDecoder` un-normalizes the
+      DiT latent with the LightTAE per-channel mean/std INSIDE its ``decode``;
+      applying the Wan ``scale_and_shift`` here too would double-normalize.
+    * ``load_model`` is a no-op. The (small ~45 MB) LightTAE decoder is custom-
+      loaded in ``OmniDreamsPipeline.load_modules`` and passed in pre-built, so
+      the lazy ``VAELoader`` path (keyed on ``model_loaded``) must be skipped.
+
+    The decoder is registered under its own ``vae_decoder`` component so the
+    Wan VAE (still used for encode) keeps the ``vae`` slot.
+    """
+
+    def scale_and_shift(self, latents: torch.Tensor, server_args):
+        return latents
+
+    def load_model(self):
+        return None

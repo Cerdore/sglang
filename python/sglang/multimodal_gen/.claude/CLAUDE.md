@@ -94,8 +94,23 @@ video diffusion model for autonomous driving simulation. It takes a text prompt,
 reference image, and optional per-frame HD-map rasters, then generates a driving video via
 chunked autoregressive rollout.
 
-**Checkpoint**: `single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt` — flat bf16, 570 keys, DiT-only.
-The Wan 2.1 VAE and Cosmos-Reason1-7B (Qwen2.5-VL) text encoder are separate downloads.
+**Checkpoint**: `single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt` — flat bf16, 570 keys, DiT-only
+(3.9 GB). The Wan 2.1 VAE and Cosmos-Reason1-7B (Qwen2.5-VL) text encoder are separate downloads.
+
+**Model layout** (all three components must be pre-placed at `model_path`):
+```
+model_path/
+  single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt   # nvidia/omni-dreams-models (gated, ~4 GB)
+  text_encoder/          # nvidia/Cosmos-Reason1-7B (public, ~16 GB)
+    config.json, model-*.safetensors, tokenizer.json, ...
+  wan_vae/               # Wan 2.1 diffusers-format VAE (public, ~485 MB)
+    config.json, diffusion_pytorch_model.safetensors
+```
+The pipeline resolves each component via `_resolve_ckpt_path()`, `_resolve_vae_path()`, and
+`_resolve_text_encoder_src()` respectively. The VAE must be in **diffusers format** (`*.safetensors`
++ `config.json`), not the flat `Wan2.1_VAE.pth` (different key naming). The VAE is NOT a Cosmos
+model — `nvidia/Cosmos-Reason1-7B-VAE` does not exist. Source: `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`
+(just the `vae/` subdirectory).
 
 ### Quick Start
 
