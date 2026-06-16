@@ -1,5 +1,7 @@
 # P4 — OmniDreams Native FP8 Acceleration: Full Scope + Implementation Plan
 
+> **Note:** Config fields referenced below (`use_fp8_dit`, `fp8_dit_attention_backend`, etc.) have been replaced by three-state `native_dit_acceleration` / `native_dit_backend`. See [omnidreams_config_migration.md](omnidreams_config_migration.md).
+
 **Correction to the earlier draft:** FP8 is **not** just the LightVAE. FlashDreams'
 `integrations/omnidreams/omnidreams_singleview/` ships native FP8 kernels for
 **two** subsystems, and the **DiT is the dominant target** (it is the bulk of the

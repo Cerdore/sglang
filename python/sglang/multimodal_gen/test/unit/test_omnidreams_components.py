@@ -17,6 +17,7 @@ from collections import Counter
 
 import numpy as np
 import PIL.Image
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.omnidreams import (
@@ -578,13 +579,14 @@ def _hdmap_stage(monkeypatch):
     """
     stage = OmniDreamsBeforeDenoisingStage.__new__(OmniDreamsBeforeDenoisingStage)
     stage.transformer = types.SimpleNamespace(patchify=lambda latent: latent)
+    stage.encoder = object()  # HD-map VAE; _vae_encode_normalized is stubbed below
     monkeypatch.setattr(
         stage,
         "_preprocess_pixels",
         lambda src, h, w, d, dt: torch.zeros(1, 3, 1, 2, 2),
     )
 
-    def fake_vae(clip):
+    def fake_vae(clip, vae=None):
         t = clip.shape[2] if clip.dim() == 5 else 1
         n_latent = 1 + (t - 1) // 4
         return torch.cat(
@@ -717,13 +719,14 @@ def test_encode_hdmap_broadcasts_single_frame_across_len_t(monkeypatch):
     stage.transformer.arch = OmniDreamsDiTArchConfig(
         in_channels=16, out_channels=16, patch_spatial=2, patch_temporal=1
     )
+    stage.encoder = object()  # HD-map VAE; _vae_encode_normalized is stubbed below
     # VAE-encode stub returns a single-frame latent [B=1, C=16, t=1, h=2, w=2]
     # -> tokens_per_frame = (h/ps)*(w/ps) = 1.
     monkeypatch.setattr(
         stage, "_preprocess_pixels", lambda src, h, w, d, dt: torch.zeros(1, 3, 1, 2, 2)
     )
     monkeypatch.setattr(
-        stage, "_vae_encode_normalized", lambda x: torch.zeros(1, 16, 1, 2, 2)
+        stage, "_vae_encode_normalized", lambda x, vae=None: torch.zeros(1, 16, 1, 2, 2)
     )
     dev = torch.device("cpu")
     b = types.SimpleNamespace(hdmap_path=1, hdmap_pixels=None)
@@ -731,3 +734,41 @@ def test_encode_hdmap_broadcasts_single_frame_across_len_t(monkeypatch):
     for len_t in (1, 2, 3):
         toks = stage._encode_hdmap(b, dev, torch.float32, torch.float32, 1, len_t, 2, 2)
         assert toks[0].shape[1] == len_t * tokens_per_frame
+
+
+# ------------------------------------------- architectural reject guards ---- #
+def test_denoising_stage_rejects_sequence_parallelism(monkeypatch):
+    """The AR rollout is not SP-aware (the windowed KV-cache loop runs per-rank
+    on the full sequence), so SP must fail loudly rather than silently produce
+    wrong output. TP is fine; only ulysses/ring SP is rejected."""
+    import sglang.multimodal_gen.runtime.distributed.parallel_state as ps
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams import (  # noqa: E501
+        OmniDreamsDenoisingStage,
+    )
+
+    monkeypatch.setattr(ps, "get_sp_world_size", lambda: 2)
+    # The SP guard is the first statement in forward(), before batch/server_args
+    # are touched, so a bare instance with no fields is sufficient to reach it.
+    stage = OmniDreamsDenoisingStage.__new__(OmniDreamsDenoisingStage)
+    with pytest.raises(AssertionError, match="Sequence parallelism"):
+        stage.forward(None, None)
+
+
+def test_block_cross_view_attention_rejected_when_enabled():
+    """Cross-view attention is a forward-looking placeholder (no multi-view
+    checkpoint exists, and even the FlashDreams reference is single-view). When
+    enabled it must raise rather than silently run global attention over all
+    tokens, which would be numerically wrong."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsBlock
+
+    block = OmniDreamsBlock(
+        x_dim=24,
+        context_dim=16,
+        num_heads=2,
+        mlp_ratio=2.0,
+        use_adaln_lora=True,
+        adaln_lora_dim=8,
+        enable_cross_view_attn=True,
+    )
+    with pytest.raises(NotImplementedError, match="Cross-view attention"):
+        block._cross_view_attn_forward(torch.randn(1, 8, 24), L=8, B=1, D=24)

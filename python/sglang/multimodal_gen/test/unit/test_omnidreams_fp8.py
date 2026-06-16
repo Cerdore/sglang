@@ -248,3 +248,262 @@ def test_mean_inv_std_buffers():
     assert torch.allclose(
         enc.inv_std.float(), expected_inv.float(), rtol=1e-5
     ), f"inv_std mismatch: {enc.inv_std}"
+
+
+# --------------------------------------------------------------------------- #
+# Config three-state validation + migration detection                          #
+# --------------------------------------------------------------------------- #
+def test_config_three_state_valid():
+    """native_dit_acceleration accepts auto/required/disabled."""
+    from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+        OmniDreamsPipelineConfig,
+    )
+
+    for mode in ("auto", "required", "disabled"):
+        cfg = OmniDreamsPipelineConfig(native_dit_acceleration=mode)
+        assert cfg.native_dit_acceleration == mode
+
+
+def test_config_three_state_invalid():
+    """Invalid mode raises ValueError."""
+    from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+        OmniDreamsPipelineConfig,
+    )
+
+    with pytest.raises(ValueError, match="Invalid native_dit_acceleration"):
+        OmniDreamsPipelineConfig(native_dit_acceleration="invalid")
+
+
+def test_config_removed_fields_raise():
+    """__post_init__ detects removed fields and raises ValueError."""
+    from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+        OmniDreamsPipelineConfig,
+    )
+
+    # dataclass won't accept unknown kwargs, so we set via object.__setattr__
+    # after construction — but __post_init__ runs at __init__ time, so we test
+    # that the field simply doesn't exist as a valid kwarg.
+    # The __post_init__ guard uses hasattr(), which catches monkey-patched attrs.
+    cfg = OmniDreamsPipelineConfig()
+    object.__setattr__(cfg, "use_fp8_dit", True)
+    with pytest.raises(ValueError, match="use_fp8_dit.*native_dit_acceleration"):
+        cfg.__post_init__()
+
+
+def test_text_encoder_config_defaults():
+    """OmniDreamsTextEncoderConfig has correct defaults."""
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsTextEncoderConfig,
+    )
+
+    cfg = OmniDreamsTextEncoderConfig()
+    assert cfg.impl == "bf16"
+    assert cfg.model_id == "nvidia/Cosmos-Reason1-7B"
+    assert cfg.fp8_model_path is None
+
+
+def test_vae_encoder_config_defaults():
+    """OmniDreamsVAEEncoderConfig has correct defaults."""
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsVAEEncoderConfig,
+    )
+
+    cfg = OmniDreamsVAEEncoderConfig()
+    assert cfg.impl == "wanvae"
+    assert cfg.native_acceleration == "disabled"
+    assert len(cfg.latents_mean) == 16
+    assert len(cfg.latents_std) == 16
+
+
+def test_vae_decoder_config_defaults():
+    """OmniDreamsVAEDecoderConfig has correct defaults."""
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsVAEDecoderConfig,
+    )
+
+    cfg = OmniDreamsVAEDecoderConfig()
+    assert cfg.impl == "wanvae"
+    assert cfg.native_acceleration == "disabled"
+
+
+def test_vae_encoder_config_pixelshuffle_not_implemented():
+    """PixelShuffle impl raises NotImplementedError."""
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsVAEEncoderConfig,
+    )
+
+    cfg = OmniDreamsVAEEncoderConfig(impl="pixelshuffle")
+    with pytest.raises(NotImplementedError):
+        cfg.setup()
+
+
+def test_pipeline_config_nested_configs_exist():
+    """OmniDreamsPipelineConfig has nested Config fields."""
+    from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+        OmniDreamsPipelineConfig,
+    )
+
+    cfg = OmniDreamsPipelineConfig()
+    assert cfg.text_encoder_config is not None
+    assert cfg.image_encoder_config is not None
+    assert cfg.encoder_config is not None
+    assert cfg.decoder_config is not None
+    assert cfg.encoder_config.impl == "wanvae"
+    assert cfg.decoder_config.impl == "wanvae"
+
+
+# --------------------------------------------------------------------------- #
+# Config setup() routing (impl selection + three-state FP8)                    #
+# --------------------------------------------------------------------------- #
+def test_default_latents_match_validated_wan_stats():
+    """The component-config default latents must equal the WanVAEArchConfig
+    defaults (the values validated end-to-end). A drift here silently corrupts
+    the VAE encode normalization ((z-mean)/std) → wrong-looking output."""
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        _DEFAULT_LATENTS_MEAN,
+        _DEFAULT_LATENTS_STD,
+    )
+    from sglang.multimodal_gen.configs.models.vaes.wanvae import OmniDreamsVAEConfig
+
+    wan = OmniDreamsVAEConfig()
+    assert tuple(_DEFAULT_LATENTS_MEAN) == tuple(wan.latents_mean)
+    assert tuple(_DEFAULT_LATENTS_STD) == tuple(wan.latents_std)
+
+
+def test_vae_encoder_wanvae_setup_routes_and_threads_latents():
+    """impl='wanvae' resolves the diffusers VAE path and loads it with a config
+    whose latents are threaded through arch_config (not top-level kwargs, which
+    would raise TypeError)."""
+    from unittest.mock import MagicMock, patch
+
+    import sglang.multimodal_gen.configs.models.omnidreams_components as comp
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsVAEEncoderConfig,
+    )
+
+    cfg = OmniDreamsVAEEncoderConfig(impl="wanvae", model_path="/fake/model")
+    with patch.object(comp, "resolve_wan_vae_path", return_value="/fake/vae") as rp, \
+         patch.object(comp, "load_wan_vae", return_value=MagicMock()) as lw:
+        cfg.setup()
+    rp.assert_called_once()
+    lw.assert_called_once()
+    vae_cfg = lw.call_args.args[0]
+    # latents readable via the VAEConfig.__getattr__ -> arch_config proxy.
+    assert tuple(vae_cfg.latents_std) == tuple(cfg.latents_std)
+
+
+def test_vae_encoder_wanvae_setup_honors_explicit_checkpoint_path():
+    """An explicit checkpoint_path bypasses path resolution."""
+    from unittest.mock import MagicMock, patch
+
+    import sglang.multimodal_gen.configs.models.omnidreams_components as comp
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsVAEEncoderConfig,
+    )
+
+    cfg = OmniDreamsVAEEncoderConfig(impl="wanvae", checkpoint_path="/explicit/vae")
+    with patch.object(comp, "resolve_wan_vae_path") as rp, \
+         patch.object(comp, "load_wan_vae", return_value=MagicMock()) as lw:
+        cfg.setup()
+    rp.assert_not_called()
+    assert lw.call_args.args[1] == "/explicit/vae"
+
+
+@pytest.mark.parametrize(
+    "mode,expect_required",
+    [("required", True), ("auto", False), ("disabled", False)],
+)
+def test_vae_encoder_lightvae_three_state_maps_to_fp8_required(mode, expect_required):
+    """LightVAE setup threads the three-state native_acceleration into the
+    encoder's fp8_required bool: only 'required' is hard-required; 'auto' and
+    'disabled' both stay soft (auto falls back, disabled skips FP8)."""
+    from unittest.mock import MagicMock, patch
+
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsVAEEncoderConfig,
+    )
+
+    cfg = OmniDreamsVAEEncoderConfig(
+        impl="lightvae",
+        checkpoint_path="/fake/lightvae.pth",
+        native_acceleration=mode,
+        fp8_state_path="/fake/fp8.pt",
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.models.vaes.omnidreams_light_vae.LightVAEEncoder"
+    ) as LV:
+        LV.return_value = MagicMock()
+        cfg.setup()
+    kwargs = LV.call_args.kwargs
+    assert kwargs["fp8_required"] is expect_required
+    # 'disabled' must not pass a calibrated FP8 state at all.
+    if mode == "disabled":
+        assert kwargs["fp8_state_path"] is None
+    else:
+        assert kwargs["fp8_state_path"] == "/fake/fp8.pt"
+
+
+def test_pipeline_config_rehydrates_dict_component_configs():
+    """A JSON pipeline-config (via --pipeline-config-path) lands nested component
+    configs as raw dicts because the base update_pipeline_config only recurses
+    into ModelConfig fields. __post_init__ must rehydrate them into real Config
+    dataclasses, else .setup() crashes on a dict at server launch."""
+    from sglang.multimodal_gen.configs.models.omnidreams_components import (
+        OmniDreamsVAEDecoderConfig,
+        OmniDreamsVAEEncoderConfig,
+    )
+    from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+        OmniDreamsPipelineConfig,
+    )
+
+    cfg = OmniDreamsPipelineConfig()
+    cfg.update_pipeline_config(
+        {
+            "native_dit_acceleration": "required",
+            "encoder_config": {"impl": "lightvae", "native_acceleration": "auto"},
+            "decoder_config": {"impl": "lighttae"},
+        }
+    )
+    assert cfg.native_dit_acceleration == "required"
+    assert isinstance(cfg.encoder_config, OmniDreamsVAEEncoderConfig)
+    assert cfg.encoder_config.impl == "lightvae"
+    assert cfg.encoder_config.native_acceleration == "auto"
+    assert isinstance(cfg.decoder_config, OmniDreamsVAEDecoderConfig)
+    assert cfg.decoder_config.impl == "lighttae"
+    # All component configs must remain callable (no leftover dicts).
+    for name in (
+        "text_encoder_config",
+        "image_encoder_config",
+        "encoder_config",
+        "decoder_config",
+    ):
+        assert hasattr(getattr(cfg, name), "setup")
+
+
+def test_shipped_accel_json_configs_load():
+    """The acceleration-path JSON pipeline-configs under test_files/ (referenced
+    by the opt-in server cases via --pipeline-config-path) must each load into a
+    config whose component slots are real dataclasses with setup(). Guards these
+    shipped test assets against rot / rehydration regressions."""
+    import glob
+    import os
+
+    from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+        OmniDreamsPipelineConfig,
+    )
+
+    here = os.path.dirname(__file__)
+    cfg_dir = os.path.normpath(os.path.join(here, "..", "test_files"))
+    json_files = sorted(glob.glob(os.path.join(cfg_dir, "omnidreams_*.json")))
+    assert json_files, f"no omnidreams_*.json under {cfg_dir}"
+
+    for path in json_files:
+        cfg = OmniDreamsPipelineConfig()
+        cfg.load_from_json(path)
+        for name in (
+            "text_encoder_config",
+            "image_encoder_config",
+            "encoder_config",
+            "decoder_config",
+        ):
+            assert hasattr(getattr(cfg, name), "setup"), f"{path}: {name} not a Config"

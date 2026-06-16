@@ -7,13 +7,20 @@ time are added in later phases.
 """
 
 from dataclasses import dataclass, field
+from typing import get_args
 
 from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
+from sglang.multimodal_gen.configs.models.omnidreams_components import (
+    OmniDreamsTextEncoderConfig,
+    OmniDreamsVAEDecoderConfig,
+    OmniDreamsVAEEncoderConfig,
+)
 from sglang.multimodal_gen.configs.models.vaes.wanvae import OmniDreamsVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.native.acceleration import NativeAccelerationMode
 
 
 def warp_flow_match_sigmas(
@@ -56,7 +63,7 @@ class OmniDreamsPipelineConfig(PipelineConfig):
     denoising_timesteps: tuple[int, ...] = (1000, 450)
     sigma_min: float = 0.0
 
-    # P0: capture the steady-state AR-rollout DiT calls into a CUDA graph and
+    # Capture the steady-state AR-rollout DiT calls into a CUDA graph and
     # replay (eliminates per-launch CPU overhead across the repeated
     # identical-shape calls). Numerically lossless. Default off until GPU
     # verification; env SGLANG_OMNIDREAMS_CUDA_GRAPH force-enables. The fill-phase
@@ -66,37 +73,53 @@ class OmniDreamsPipelineConfig(PipelineConfig):
     # torch.compile autotune when --enable-torch-compile is also on).
     cuda_graph_warmup_iters: int = 2
 
-    # P1 (LOSSY): swap the Wan VAE *decode* for the LightX2V LightTAE (TAEHV)
-    # tiny decoder. Large decode speedup, FVD ~24.8 -> ~45.4 (paper Table 5).
-    # Encode stays on the Wan VAE unless use_light_vae_encoder is also set.
-    # Default off; the loader emits a one-time quality warning when enabled.
-    use_light_tae: bool = False
-    # Path to the LightTAE checkpoint (lighttaew2_1.pth). None -> resolve from
-    # the model dir / a sibling of the DiT checkpoint.
-    light_tae_path: str | None = None
+    # ===== Unified nested Config architecture (replaces flat bool fields) =====
+    text_encoder_config: OmniDreamsTextEncoderConfig | None = field(
+        default_factory=OmniDreamsTextEncoderConfig
+    )
+    image_encoder_config: OmniDreamsVAEEncoderConfig | None = field(
+        default_factory=lambda: OmniDreamsVAEEncoderConfig(impl="wanvae")
+    )
+    encoder_config: OmniDreamsVAEEncoderConfig = field(
+        default_factory=lambda: OmniDreamsVAEEncoderConfig(impl="wanvae")
+    )
+    decoder_config: OmniDreamsVAEDecoderConfig = field(
+        default_factory=lambda: OmniDreamsVAEDecoderConfig(impl="wanvae")
+    )
 
-    # P2 (LOSSY): swap the Wan VAE *encode* for the 75%-pruned LightVAE encoder
-    # (first-frame image + HD-map). Encode speedup, same FVD tradeoff family.
-    use_light_vae_encoder: bool = False
-    light_vae_path: str | None = None
-
-    # P4a (LOSSY, native, sm_120): run the DiT through the native FP8
-    # optimized_dit_forward (FP8 tensor-core GEMMs + FP8 attention + AdaLN).
-    # Biggest single speedup; requires the built native ext (else falls back to
-    # the eager/bf16 DiT, or raises when SGLANG_OMNIDREAMS_FP8_DIT is set).
-    # Mutually exclusive with enable_cuda_graph (the native op owns its own graph).
-    use_fp8_dit: bool = False
-    # FP8 attention backend: "auto" | "cudnn" | "sage3" | "sage3_fp8" | "sparge".
-    fp8_dit_attention_backend: str = "auto"
+    # DiT FP8 three-state mode (kept as flat fields, not a nested Config).
+    native_dit_acceleration: NativeAccelerationMode = "disabled"
+    native_dit_backend: str = "auto"
     # Block-sparse top-k ratio for the "sparge" attention backend (0, 1].
     fp8_dit_sparge_topk: float | None = None
 
-    # P4b (LOSSY, native, sm_120): native FP8 LightVAE encoder. Requires P2
-    # (use_light_vae_encoder) + a calibrated state (light_vae_fp8_state_path or
-    # SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH). Falls back to the PyTorch
-    # LightVAE encoder when the native ext / state is unavailable.
-    use_light_vae_fp8: bool = False
-    light_vae_fp8_state_path: str | None = None
+    def __post_init__(self):
+        """Detect removed fields and guide migration to new Config structure."""
+        self._rehydrate_component_configs()
+
+        removed_fields = {
+            "use_light_vae_encoder": "encoder_config.impl / image_encoder_config.impl",
+            "light_vae_path": "encoder_config.checkpoint_path / image_encoder_config.checkpoint_path",
+            "use_light_tae": "decoder_config.impl",
+            "light_tae_path": "decoder_config.checkpoint_path",
+            "use_fp8_dit": "native_dit_acceleration",
+            "fp8_dit_attention_backend": "native_dit_backend",
+            "use_light_vae_fp8": "encoder_config.native_acceleration + encoder_config.fp8_state_path",
+            "light_vae_fp8_state_path": "encoder_config.fp8_state_path / image_encoder_config.fp8_state_path",
+        }
+        for old, new in removed_fields.items():
+            if hasattr(self, old):
+                raise ValueError(
+                    f"OmniDreamsPipelineConfig field '{old}' has been removed. "
+                    f"Use '{new}' instead. See docs/omnidreams_config_migration.md"
+                )
+
+        # Validate three-state mode
+        if self.native_dit_acceleration not in get_args(NativeAccelerationMode):
+            raise ValueError(
+                f"Invalid native_dit_acceleration: {self.native_dit_acceleration}. "
+                f"Must be 'auto', 'disabled', or 'required'."
+            )
 
     def denoising_sigmas(self) -> list[float]:
         return warp_flow_match_sigmas(
@@ -104,3 +127,24 @@ class OmniDreamsPipelineConfig(PipelineConfig):
             self.flow_shift if self.flow_shift is not None else 5.0,
             self.sigma_min,
         )
+
+    def _rehydrate_component_configs(self) -> None:
+        """Convert dict-valued component configs back into their dataclasses.
+
+        The base ``update_pipeline_config`` (used by ``--pipeline-config-path``
+        JSON) only recurses into ``ModelConfig`` fields; the OmniDreams component
+        configs are plain dataclasses, so a JSON override lands as a raw ``dict``
+        and breaks ``.setup()``. Rehydrate them here (``__post_init__`` runs after
+        the JSON merge), so a JSON like ``{"encoder_config": {"impl": "lightvae"}}``
+        yields a real ``OmniDreamsVAEEncoderConfig``.
+        """
+        dict_fields = {
+            "text_encoder_config": OmniDreamsTextEncoderConfig,
+            "image_encoder_config": OmniDreamsVAEEncoderConfig,
+            "encoder_config": OmniDreamsVAEEncoderConfig,
+            "decoder_config": OmniDreamsVAEDecoderConfig,
+        }
+        for name, cls in dict_fields.items():
+            value = getattr(self, name)
+            if isinstance(value, dict):
+                setattr(self, name, cls(**value))

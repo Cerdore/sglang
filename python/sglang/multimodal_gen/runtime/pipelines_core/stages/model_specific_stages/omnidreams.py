@@ -89,6 +89,9 @@ _TEXT_EMBED_CACHE_MAX_SIZE = 32
 # any other single string is treated as one image (degenerate broadcast).
 _HDMAP_VIDEO_EXTS = (".mp4", ".gif", ".webm", ".mov", ".mkv", ".avi")
 
+# Cache for pre-built latent normalization tensors (keyed by VAE id, device, dtype).
+_latent_norm_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
 # --------------------------------------------------------------------------- #
 # Diagnostics helpers                                                         #
 # --------------------------------------------------------------------------- #
@@ -138,43 +141,48 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         scheduler=None,
         text_encoder=None,
         tokenizer=None,
-        vae=None,
+        image_encoder=None,
+        encoder=None,
         config=None,
-        vae_component_name: str = "vae",
     ) -> None:
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
-        self.vae = vae
+        self.image_encoder = image_encoder  # one-shot first-frame I2V conditioning
+        self.encoder = encoder  # per-AR-step HDMap conditioning
         self.config = config
-        # Residency component key for the encode VAE: "vae" (Wan) by default, or
-        # "vae_encoder" when the P2 LightVAE encoder is swapped in (so the Wan
-        # VAE keeps the "vae" slot for the decode path).
-        self._vae_component_name = vae_component_name
         # Per-instance LRU cache: prompt string -> text embedding on CPU.
         self._text_embed_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        """Declare the text encoder + VAE so the residency manager can stage
-        them on the GPU only around their use-sites (and offload them again
-        afterwards) when ``--text-encoder-cpu-offload`` / ``--vae-cpu-offload``
-        are set. The DiT is only used here via the weightless ``patchify``
-        rearrange, so it is not declared (its weights stay wherever loaded).
-        """
+        """Declare text_encoder + image_encoder + encoder for residency manager."""
         stage_name = self._component_stage_name(stage_name)
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        return [
-            ComponentUse(stage_name=stage_name, component_name="text_encoder"),
+        uses = [ComponentUse(stage_name=stage_name, component_name="text_encoder")]
+
+        # image_encoder (may be None for T2V tasks without I2V conditioning)
+        if self.image_encoder is not None:
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="image_encoder",
+                    target_dtype=vae_dtype,
+                )
+            )
+
+        # encoder (HDMap, always present)
+        uses.append(
             ComponentUse(
                 stage_name=stage_name,
-                component_name=self._vae_component_name,
+                component_name="encoder",
                 target_dtype=vae_dtype,
-            ),
-        ]
+            )
+        )
+        return uses
 
     # ----- helpers ---------------------------------------------------------- #
     @torch.no_grad()
@@ -350,27 +358,39 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         x = self._preprocess_pixels(image, height, width, device, vae_dtype)
         if x is None:
             return None
-        return self._vae_encode_normalized(x)
+        return self._vae_encode_normalized(x, self.image_encoder)
 
     @torch.no_grad()
-    def _vae_encode_normalized(self, x: torch.Tensor) -> torch.Tensor:
+    def _vae_encode_normalized(
+        self, x: torch.Tensor, vae: nn.Module
+    ) -> torch.Tensor:
         """``[B,3,T,H,W]`` pixels -> latent normalized into the DiT space.
 
         Encode, take the distribution mode (deterministic), then ``(z-mean)/std``.
         Shared by the i2v reference frame and the HD-map conditioning encode.
+
+        Args:
+            x: Input pixels in [-1, 1] range.
+            vae: VAE encoder module (image_encoder or encoder).
         """
-        latent_dist = self.vae.encode(x)
+        latent_dist = vae.encode(x)
         latent = (
             latent_dist.mode()
             if hasattr(latent_dist, "mode")
             else latent_dist.sample() if hasattr(latent_dist, "sample") else latent_dist
         )
-        mean = torch.tensor(
-            self.vae.latents_mean, device=latent.device, dtype=latent.dtype
-        ).view(1, -1, 1, 1, 1)
-        std = torch.tensor(
-            self.vae.latents_std, device=latent.device, dtype=latent.dtype
-        ).view(1, -1, 1, 1, 1)
+        cache_key = (id(vae), latent.device, latent.dtype)
+        cached = _latent_norm_cache.get(cache_key)
+        if cached is None:
+            mean = torch.tensor(
+                vae.latents_mean, device=latent.device, dtype=latent.dtype
+            ).view(1, -1, 1, 1, 1)
+            std = torch.tensor(
+                vae.latents_std, device=latent.device, dtype=latent.dtype
+            ).view(1, -1, 1, 1, 1)
+            _latent_norm_cache[cache_key] = (mean, std)
+        else:
+            mean, std = cached
         normed = (latent - mean) / std
         _log_omnidreams_stats("vae_encode_normed", normed)
         return normed
@@ -456,7 +476,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                     "(all chunks fall back to zeros). Check hdmap input."
                 )
                 return None
-            latent = self._vae_encode_normalized(x).to(dit_dtype)  # [B,16,1,h,w]
+            latent = self._vae_encode_normalized(x, self.encoder).to(dit_dtype)  # [B,16,1,h,w]
             if num_latent > 1 and latent.ndim == 5 and latent.shape[2] == 1:
                 latent = latent.repeat(1, 1, num_latent, 1, 1)
         else:
@@ -481,7 +501,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                     "HDMap (all chunks fall back to zeros). Check hdmap input."
                 )
                 return None
-            latent = self._vae_encode_normalized(clip).to(dit_dtype)  # [B,16,L,h,w]
+            latent = self._vae_encode_normalized(clip, self.encoder).to(dit_dtype)  # [B,16,L,h,w]
 
         if latent.shape[2] != num_latent:
             logger.warning(
@@ -652,8 +672,8 @@ class OmniDreamsDenoisingStage(DenoisingStage):
     authoritative (clean) K/V into the cache.
     """
 
-    def __init__(self, transformer, scheduler, vae=None) -> None:
-        super().__init__(transformer, scheduler, vae=vae)
+    def __init__(self, transformer, scheduler, decoder=None) -> None:
+        super().__init__(transformer, scheduler, vae=decoder)
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -827,7 +847,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # Loop-invariant context-noise timestep tensor (same scalar every chunk).
         ctx_noise_t = torch.tensor(context_noise, device=device, dtype=dit_dtype)
 
-        # P0: CUDA-graph capture of the steady-state DiT calls. The 3 calls per
+        # CUDA-graph capture of the steady-state DiT calls. The 3 calls per
         # chunk (2 self-forcing denoise steps + 1 context re-forward) share
         # identical tensor shapes once the KV window is steady, so a single
         # captured graph replays for all of them. ``_dit_call`` binds the
@@ -864,25 +884,35 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             else None
         )
 
-        # P4a: native FP8 DiT (optimized_dit_forward). Mutually exclusive with
-        # the P0 CUDA graph (the native op manages its own graph). GPU/sm_120
+        # Native FP8 DiT (optimized_dit_forward). Mutually exclusive with
+        # the CUDA graph (the native op manages its own graph). GPU/sm_120
         # only -- build_fp8_dit returns None when the native ext is unavailable,
         # so this transparently falls back to the eager (or P0) DiT.
         fp8_dit = None
-        if getattr(config, "use_fp8_dit", False) or envs.SGLANG_OMNIDREAMS_FP8_DIT:
+        mode = getattr(config, "native_dit_acceleration", "disabled")
+        if envs.SGLANG_OMNIDREAMS_FP8_DIT:
+            mode = "required"  # env forces required mode
+
+        if mode != "disabled":
             if cuda_graph_runner is not None:
                 logger.warning(
-                    "OmniDreams: use_fp8_dit overrides enable_cuda_graph (the "
-                    "native FP8 op manages its own CUDA graph)."
+                    "OmniDreams: native_dit_acceleration overrides enable_cuda_graph "
+                    "(the native FP8 op manages its own CUDA graph)."
                 )
                 cuda_graph_runner = None
             fp8_dit = build_fp8_dit(
                 self.transformer,
                 arch,
-                attention_backend=getattr(config, "fp8_dit_attention_backend", "auto"),
+                mode=mode,
+                attention_backend=getattr(config, "native_dit_backend", "auto"),
                 sparge_topk=getattr(config, "fp8_dit_sparge_topk", None),
             )
-            if fp8_dit is None:
+            if fp8_dit is None and mode == "required":
+                raise RuntimeError(
+                    "native_dit_acceleration='required' but native FP8 DiT unavailable. "
+                    "Check sm_120 native ext build."
+                )
+            elif fp8_dit is None:
                 logger.info("OmniDreams: native FP8 DiT unavailable; using eager DiT.")
 
         latent_chunks: list[torch.Tensor] = []
@@ -913,7 +943,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
             def _call_dit(hidden_states, timestep):
                 if fp8_dit is not None:
-                    # P4a native FP8 path (owns its own KV write at write_start).
+                    # Native FP8 path (owns its own KV write at write_start).
                     return fp8_dit(
                         hidden_states=hidden_states,
                         encoder_hidden_states=text,

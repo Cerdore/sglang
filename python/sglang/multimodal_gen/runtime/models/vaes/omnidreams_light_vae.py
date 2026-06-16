@@ -352,7 +352,7 @@ class LightVAEEncoder(nn.Module):
         self.eval().requires_grad_(False)
         self.to(dtype=dtype)
 
-        # P4b: normalization buffers consumed by the native FP8 staged-state
+        # Normalization buffers consumed by the native FP8 staged-state
         # builder (``build_lightvae_encoder_fp8_staged_state`` reads .mean and
         # .inv_std). Real tensors (moved with .to(device/dtype) by the loader);
         # ``persistent=False`` keeps them out of state_dict (strict=False load
@@ -368,7 +368,7 @@ class LightVAEEncoder(nn.Module):
             persistent=False,
         )
 
-        # P4b: native FP8 lazy state (no work at init — model may be on CPU).
+        # Native FP8 lazy state (no work at init — model may be on CPU).
         self._fp8_state_path = fp8_state_path
         self._fp8_required = bool(fp8_required)
         self._fp8_enabled = fp8_state_path is not None
@@ -380,7 +380,7 @@ class LightVAEEncoder(nn.Module):
         return None
 
     # ------------------------------------------------------------------ #
-    # P4b: native FP8 encode backend (sm_120 / CUDA only)                #
+    # Native FP8 encode backend (sm_120 / CUDA only)                     #
     # ------------------------------------------------------------------ #
     def _get_native_handle(self, device: torch.device) -> Any:
         """Lazy-build the native FP8 encoder handle, cached per device.

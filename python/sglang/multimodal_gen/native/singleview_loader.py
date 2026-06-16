@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import contextlib
+import glob
 import hashlib
 import importlib.util
 import json
@@ -92,9 +93,8 @@ def validate_thirdparty() -> dict[str, Any]:
     the only thing that matters is that the 3rdparty headers are present."""
 
     # Fast path: prebuilt .so exists → skip stamp verification.
-    import glob as _glob
     _build_dir = _ROOT / "build" / "torch_extensions"
-    if any(_glob.glob(str(_build_dir / "omnidreams_singleview_native_*/*.so"))):
+    if any(glob.glob(str(_build_dir / "omnidreams_singleview_native_*/*.so"))):
         return _thirdparty_info_no_validation()
 
     return {
@@ -494,10 +494,8 @@ def load_extension(
 
 def _thirdparty_info_no_validation() -> dict[str, Any]:
     """Return 3rdparty paths without stamp validation (prebuilt .so exists)."""
-    import json as _json
-
     manifest_path = _ROOT / "thirdparty_sources.json"
-    manifest = _json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
     info: dict[str, Any] = {}
     for src in manifest["sources"]:
         d = _ROOT / "3rdparty" / src["directory"]
@@ -514,8 +512,6 @@ def _thirdparty_info_no_validation() -> dict[str, Any]:
 
 def _load_prebuilt_extension() -> ModuleType | None:
     """Try to load a previously compiled .so from the build directory."""
-    import glob as _glob
-
     # Add pip CUDA + torch lib paths so the prebuilt .so can resolve
     # libcudnn.so.9 and libc10.so at load time.
     _extra_lib = []
@@ -537,7 +533,7 @@ def _load_prebuilt_extension() -> ModuleType | None:
     build_dir = _ROOT / "build" / "torch_extensions"
     for pattern in ("omnidreams_singleview_native_*/omnidreams*.so",
                      "*/omnidreams*.so"):
-        candidates = sorted(_glob.glob(str(build_dir / pattern)))
+        candidates = sorted(glob.glob(str(build_dir / pattern)))
         for so_path in candidates:
             try:
                 # PyTorch C++ extension exports PyInit_<dirname>(), so match

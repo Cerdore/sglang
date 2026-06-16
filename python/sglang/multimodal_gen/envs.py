@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     # OmniDreams P4b: path to the calibrated LightVAE FP8 encoder state (.pt).
     # SGLang-prefixed analogue of OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH.
     SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH: str | None = None
+    # OmniDreams: path to W8A8 FP8 text encoder (compressed-tensors format).
+    SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH: str | None = None
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -275,6 +277,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OmniDreams P4b: calibrated LightVAE FP8 encoder state path.
     "SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH": _lazy_str(
         "SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH"
+    ),
+    # OmniDreams: W8A8 FP8 text encoder (compressed-tensors format) path.
+    "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH": _lazy_str(
+        "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

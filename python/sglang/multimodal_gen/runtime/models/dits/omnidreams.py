@@ -881,19 +881,10 @@ class OmniDreamsDiT(BaseDiT):
             "call post_load_weights() before forward (fuses padding-mask + "
             "last-layer shuffle)"
         )
-        # P3 (torch.compile): a single chunk's forward IS compile-safe under
-        # fullgraph=False. The dynamic parts the old assert guarded against --
-        # the AR chunk loop and the BlockKVCache window roll -- live in
-        # OmniDreamsDenoisingStage, OUTSIDE this forward. The only dynamic ops
-        # reachable here are the per-block KV read (variable-length slice during
-        # fill) and the in-place KV write, which graph-break cleanly under
-        # fullgraph=False. Enabled via --enable-torch-compile, which routes
-        # through DenoisingStage._maybe_enable_torch_compile ->
-        # module.compile(mode="max-autotune-no-cudagraphs"); that mode is also
-        # mandatory so inductor does not install its own CUDA graphs that would
-        # collide with the external P0 OmniDreamsCUDAGraphRunner.
-        # Phase 6: SP (ulysses/ring sequence parallelism) is not yet supported
-        # for the autoregressive chunk loop. Guard with a clear error.
+        # A single chunk's forward is compile-safe under fullgraph=False: the
+        # only dynamic ops here are the per-block KV read/write, which graph-break
+        # cleanly. torch.compile must use max-autotune-no-cudagraphs so inductor
+        # does not install CUDA graphs that collide with OmniDreamsCUDAGraphRunner.
         if self._sp_size > 1:
             raise RuntimeError(
                 "Sequence parallelism (SP) is not yet supported for OmniDreams. "

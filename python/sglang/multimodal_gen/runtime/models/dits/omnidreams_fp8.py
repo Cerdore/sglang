@@ -115,22 +115,6 @@ class _SGLTransformerAdapter:
         self._use_cuda_graph = False
         self._cuda_graph_capture_ar_idx = 0
 
-        # SGLang's _fuse_padding_mask_into_patch_embed() shrinks x_embedder
-        # weight from [2048, 72] to [2048, 68] (drops the always-zero
-        # pad-mask channels). The native kernel internally concatenates
-        # noisy(2048) + mask(4) = 2052, then projects via x_embedder.
-        # SGLang passes pre-embedded 2048-dim hidden states, so replace
-        # x_embedder with identity⊕zero-pad: [x,mask] → x·I + mask·0 = x.
-        x_embedder = getattr(sgl_dit, "x_embedder", None)
-        if x_embedder is not None:
-            proj = x_embedder.proj[1]
-            out_dim = proj.weight.shape[0]
-            proj.weight.data = torch.nn.functional.pad(
-                torch.eye(out_dim, dtype=proj.weight.dtype, device=proj.weight.device),
-                (0, 4),
-            )
-            proj.bias = None
-
     def _maybe_inject_image(self, latent, cache):
         return latent
 
@@ -233,15 +217,29 @@ class OmniDreamsFP8DiT:
         return out.reshape(B, L, out.shape[-1]).to(hidden_states.dtype)
 
 
-def build_fp8_dit(sgl_dit: Any, arch: Any, *, mode: str | None = None,
-                  attention_backend: str = "auto",
-                  sparge_topk: float | None = None) -> OmniDreamsFP8DiT | None:
-    if mode is None:
-        mode = "required" if envs.SGLANG_OMNIDREAMS_FP8_DIT else "auto"
+def build_fp8_dit(
+    sgl_dit: Any,
+    arch: Any,
+    *,
+    mode: str,  # Required: "auto" | "disabled" | "required"
+    attention_backend: str = "auto",
+    sparge_topk: float | None = None,
+) -> OmniDreamsFP8DiT | None:
+    """Build native FP8 DiT wrapper.
+
+    Args:
+        mode: "auto" (try, fallback on failure), "required" (raise on failure),
+              "disabled" (return None).
+    """
+    if mode == "disabled":
+        return None
     native = _load_native(mode)
     if native is None:
         return None
     return OmniDreamsFP8DiT(
-        sgl_dit, arch, native,
-        attention_backend=attention_backend, sparge_topk=sparge_topk,
+        sgl_dit,
+        arch,
+        native,
+        attention_backend=attention_backend,
+        sparge_topk=sparge_topk,
     )
