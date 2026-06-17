@@ -5,7 +5,7 @@
 **Date:** 2026-06-17 (updated). **Branch:** `feat/omnidreams-p0-p4b-optimizations`.
 **Dev box:** CPU-only macOS. GPU validation on `rtx6k` (AutoDL container, NVIDIA RTX 6000D 85GB, CUDA 12.8/13.0, torch 2.11.0+cu130). **SSH:** `ssh rtx6k` → AutoDL west-E container.
 
-Plan: `docs/superpowers/omnidreams_optimization_plan.md`. FP8 design: `docs/superpowers/omnidreams_p4_fp8_design.md`.
+Plan: `docs/superpowers/omnidreams_optimization_plan.md`. FP8 design: `docs/superpowers/omnidreams_p4_fp8_design.md`. **P4a diagnosis:** [omnidreams_p4a_weight_mapping_diagnosis.md](omnidreams_p4a_weight_mapping_diagnosis.md).
 Reference source (local): `/Users/cerdore/gitRepo/flashdreams`. Checkpoints: `/Users/cerdore/gitRepo/models/{omni-dreams-models/single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt, lighttaew2_1.pth, lightvaew2_1.pth}`.
 
 ## CPU test invariant (IMPORTANT)
@@ -134,20 +134,29 @@ sglang serve --model-path /root/autodl-fs/omni-dreams-models \
 6. **DiT FP8 `_ExecConfig` missing attrs** — vendored `OptimizedDiTExecutor` reads `config.use_cuda_graph`/`cuda_graph_warmup_iters`. Fix: add both to `_ExecConfig`.
 7. **DiT FP8 duplicate `_ensure_fp8_runtime` call** — SGLang wrapper called it with incomplete args; `_predict_flow_ext_impl` already handles it internally. Fix: remove duplicate call.
 
-## DiT FP8 status (P4a) — partially blocked
+## DiT FP8 status (P4a) — blocked, diagnosed
+
+> See detailed diagnosis: [omnidreams_p4a_weight_mapping_diagnosis.md](omnidreams_p4a_weight_mapping_diagnosis.md)
 
 **Unit test:** ✅ PASS (build + executor creation).  
-**E2E:** ❌ Native CUDA kernel crashes at `cosmos_run_transformer_block_streaming: block 0: unknown error` inside `optimized_dit_forward`.
+**E2E:** ❌ `cosmos_run_transformer_block_streaming failed at block 0: unknown error`.
 
-Root cause (preliminary): the vendored `OptimizedDiTExecutor` (from FlashDreams) expects the FlashDreams DiT structure — state_dict key names, network sub-module layout, and `prepare_cosmos_quantized_streaming_weights` conversion all differ from SGLang's `OmniDreamsDiT`. The FP8 weights get built with wrong shapes/layouts, and the native CUDA kernel aborts on the first block.
+### Root cause (confirmed by dump 2026-06-17 on chen WSL2)
 
-**Next steps for DiT FP8 fix:**
-1. Dump state_dict keys from both FlashDreams DiT and SGLang `OmniDreamsDiT`, map the differences
-2. Add key-name translation to `_SGLTransformerAdapter` or `_ensure_weights_snapshot`
-3. Verify weight shapes match BLAS GEMM expectations (K/N dimensions for FP8 kernels)
-4. Handoff doc already references this gap: `p4a-optimized-dit-flashdreams-import-bug.md`
+`prepare_cosmos_quantized_streaming_weights` fuses `q_proj` + `k_proj` + `v_proj` → `qkv_proj` and **removes** the individual keys. The C++ bridge (`streaming_dit_bridge.cu`) does key-based weight lookup with original per-projection key names → null pointer → `cudaErrorUnknown` at block 0. 17/20 bridge keys are present; only the 3 self-attn Q/K/V projection keys are missing.
 
-**Workaround:** `native_dit_acceleration="disabled"` (default); LightVAE-FP8 (P4b) provides the bulk of E2E speedup.
+### Attempted fix (2026-06-17)
+
+Added `_restore_split_qkv_aliases()` in `OmniDreamsFP8DiT` to slice individual Q/K/V weight aliases from the fused qkv_proj. **Result:** still crashes with same error. The restored aliases are `torch.uint8` (sliced from FP8-quantized qkv) without `_fp8_prepared_scale`, so the bridge's `resolve_fp8_or_bf16` falls through to the bf16 path but reads uint8 bytes as bf16 → garbage values → crash.
+
+### Next steps
+
+1. **Test with `cosmos_forward` (PyTorch ATen path) first** — same weights dict, no CUDA kernel. Isolate whether crash is weight-level or kernel-level.
+2. Fix Q/K/V restore: use bf16 `_prepared` tensor to slice, not uint8.
+3. Verify x_embedder pad shape + cross_attn key-value dimension compatibility.
+4. Full key mapping audit: dump FlashDreams `CosmosDiTNetwork` state_dict keys vs SGLang `OmniDreamsDiT`.
+
+**Workaround:** `native_dit_acceleration="disabled"` (default). P1+P2+LightVAE-FP8 (P4b) provide bulk of E2E speedup without DiT FP8.
 
 ## Remaining tasks
 
