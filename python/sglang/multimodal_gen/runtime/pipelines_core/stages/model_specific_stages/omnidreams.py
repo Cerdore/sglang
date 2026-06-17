@@ -564,7 +564,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
 
         # --- i2v reference latent -> patchified frame-0 token block ---
         with self.use_declared_component(
-            component_name=self._vae_component_name, module=self.vae
+            component_name="image_encoder", module=self.image_encoder
         ):
             image_latent = self._encode_reference_image(
                 batch, device, vae_dtype, height, width
@@ -593,7 +593,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         num_chunks = self._compute_num_chunks(batch, len_t)
         # Per-chunk HD-map tokens (None -> AR stage uses zeros / HDMap disabled).
         with self.use_declared_component(
-            component_name=self._vae_component_name, module=self.vae
+            component_name="encoder", module=self.encoder
         ):
             hdmap_tokens = self._encode_hdmap(
                 batch, device, vae_dtype, dit_dtype, num_chunks, len_t, height, width

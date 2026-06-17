@@ -6,8 +6,9 @@ Phase 0 wires the static structure (DiT config, VAE reuse, task type) and the
 time are added in later phases.
 """
 
+import json
 from dataclasses import dataclass, field
-from typing import get_args
+from typing import Any, get_args
 
 from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
 from sglang.multimodal_gen.configs.models.omnidreams_components import (
@@ -128,6 +129,15 @@ class OmniDreamsPipelineConfig(PipelineConfig):
             self.sigma_min,
         )
 
+    # Fields whose JSON dicts must be intercepted BEFORE the base
+    # ``update_pipeline_config`` loop so they aren't mistaken for ``ModelConfig``.
+    _COMPONENT_CONFIG_FIELDS = (
+        "text_encoder_config",
+        "image_encoder_config",
+        "encoder_config",
+        "decoder_config",
+    )
+
     def _rehydrate_component_configs(self) -> None:
         """Convert dict-valued component configs back into their dataclasses.
 
@@ -148,3 +158,32 @@ class OmniDreamsPipelineConfig(PipelineConfig):
             value = getattr(self, name)
             if isinstance(value, dict):
                 setattr(self, name, cls(**value))
+
+    def load_from_json(self, file_path: str):
+        """Load config from JSON, protecting component-config fields."""
+        with open(file_path) as f:
+            input_pipeline_dict = json.load(f)
+        self._update_pipeline_config_with_component_protection(input_pipeline_dict)
+
+    def update_pipeline_config(self, source_pipeline_dict: dict[str, Any]) -> None:
+        """Override to protect component-config fields from the base-class
+        ``ModelConfig`` recursion (these are plain dataclasses, not ModelConfigs)."""
+        self._update_pipeline_config_with_component_protection(source_pipeline_dict)
+
+    def _update_pipeline_config_with_component_protection(
+        self, source_pipeline_dict: dict[str, Any]
+    ) -> None:
+        """Pop component-config dicts, delegate everything else to base, then rehydrate."""
+        component_overrides: dict[str, Any] = {}
+        for key in self._COMPONENT_CONFIG_FIELDS:
+            if key in source_pipeline_dict:
+                component_overrides[key] = source_pipeline_dict.pop(key)
+
+        # Let base-class loop handle the remaining (e.g. dit_config, vae_config).
+        super().update_pipeline_config(source_pipeline_dict)
+
+        # Apply component-config overrides as raw dicts; _rehydrate picks them up.
+        for key, value in component_overrides.items():
+            setattr(self, key, value)
+
+        self._rehydrate_component_configs()

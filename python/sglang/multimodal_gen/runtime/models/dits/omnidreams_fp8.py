@@ -192,6 +192,16 @@ class OmniDreamsFP8DiT:
         inv = ex._ensure_invariant_tensors(ar_idx=ar_idx, timesteps=timestep_b)
         rope_cos, rope_sin = ex._ensure_rope_tensors(ar_idx=ar_idx, rope_freqs=rope_freqs)
         ex._ensure_weights_snapshot()
+        # SGLang fused the pad-mask channel out of x_embedder (72→68), but
+        # the native kernel expects 72-ch. Replace with identity+zeros so
+        # already-embedded tokens pass through unchanged.
+        _xe = ex._optimized_weights.get("x_embedder.proj.1.weight")
+        if _xe is not None and _xe.shape[1] != D + 4:
+            ex._optimized_weights["x_embedder.proj.1.weight"] = torch.nn.functional.pad(
+                torch.eye(D, dtype=_xe.dtype, device=_xe.device), (0, 4)
+            )
+            ex._optimized_weights.pop("x_embedder.proj.1.weight_fp8_prepared", None)
+            ex._optimized_weights.pop("x_embedder.proj.1.weight_fp8_prepared_scale", None)
 
         k_self = [c._k for c in kv_caches]
         v_self = [c._v for c in kv_caches]
