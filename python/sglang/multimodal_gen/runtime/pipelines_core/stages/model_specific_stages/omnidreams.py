@@ -864,12 +864,13 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         ) and device.type == "cuda"
 
         def _dit_call(hidden_states, timestep, cond_mask_t, rope_t, hdmap_t):
+            # Eager path: rope_t is the [L, D] cos|sin cache (shift_t).
             return self.transformer(
                 hidden_states=hidden_states,
                 encoder_hidden_states=text,
                 timestep=timestep,
                 condition_video_input_mask=cond_mask_t,
-                rope_freqs=rope_t,
+                rope_cos_sin=rope_t,
                 hdmap_condition=hdmap_t,
                 kv_caches=caches,
                 cross_attn_kv=cross_attn_kv,
@@ -976,7 +977,13 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         latent_chunks: list[torch.Tensor] = []
         for chunk_idx in range(num_chunks):
-            rope_freqs = rope.shift_t(chunk_idx)
+            # Eager/CUDA-graph paths consume the [L, D] cos|sin cache; the native
+            # FP8 path needs the raw-angle [L,1,1,head_dim] tensor (it takes
+            # cos/sin itself). Only build the latter when native is active.
+            rope_cos_sin = rope.shift_t(chunk_idx)
+            rope_freqs = (
+                rope.shift_t_freqs(chunk_idx) if fp8_dit is not None else None
+            )
             is_first = chunk_idx == 0
             cond_mask = cond_mask_c0 if is_first else cond_mask_zero
             # HD-map is per-chunk: index this chunk's tokens (None -> zeros, i.e.
@@ -1020,10 +1027,10 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                     )
                 if steady_now:
                     return cuda_graph_runner(
-                        hidden_states, timestep, cond_mask, rope_freqs, hdmap_chunk
+                        hidden_states, timestep, cond_mask, rope_cos_sin, hdmap_chunk
                     )
                 return _dit_call(
-                    hidden_states, timestep, cond_mask, rope_freqs, hdmap_chunk
+                    hidden_states, timestep, cond_mask, rope_cos_sin, hdmap_chunk
                 )
 
             def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:

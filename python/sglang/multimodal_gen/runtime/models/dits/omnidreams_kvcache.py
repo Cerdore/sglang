@@ -108,7 +108,6 @@ class BlockKVCache:
         assert (
             -tensor_dim <= self.seq_dim < tensor_dim
         ), f"seq_dim must be in [-{tensor_dim}, {tensor_dim}), got {self.seq_dim}"
-        # Normalize seq_dim to a non-negative index.
         self.seq_dim = self.seq_dim if self.seq_dim >= 0 else self.seq_dim + tensor_dim
 
         assert self.sink_size >= 0, "sink_size must be non-negative"
@@ -123,8 +122,8 @@ class BlockKVCache:
             f"divisible by chunk_size ({self.chunk_size})"
         )
 
-        self._k = torch.empty(self.k_shape, device=self.device, dtype=self.dtype)
-        self._v = torch.empty(self.v_shape, device=self.device, dtype=self.dtype)
+        self._k = torch.zeros(self.k_shape, device=self.device, dtype=self.dtype)
+        self._v = torch.zeros(self.v_shape, device=self.device, dtype=self.dtype)
 
     # ----- internal helpers ------------------------------------------------- #
     def _seq_slice(self, start: int | None, end: int | None) -> tuple[slice | int, ...]:
@@ -154,12 +153,8 @@ class BlockKVCache:
             self._k[s1_dst].copy_(self._k[s1_src])
             self._v[s1_dst].copy_(self._v[s1_src])
             if copy1 < tokens_to_keep:
-                s2_dst = self._seq_slice(
-                    dst_start + copy1, dst_start + tokens_to_keep
-                )
-                s2_src = self._seq_slice(
-                    src_start + copy1, src_start + tokens_to_keep
-                )
+                s2_dst = self._seq_slice(dst_start + copy1, dst_start + tokens_to_keep)
+                s2_src = self._seq_slice(src_start + copy1, src_start + tokens_to_keep)
                 self._k[s2_dst].copy_(self._k[s2_src])
                 self._v[s2_dst].copy_(self._v[s2_src])
 

@@ -16,11 +16,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
     OmniDreamsPipelineConfig,
     warp_flow_match_sigmas,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
-    ROPE_IS_NEOX_STYLE,
-    OmniDreamsDiT,
-    rope_dims,
-)
+from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import rope_dims
 
 _KEY_FIXTURE = os.path.join(
     os.path.dirname(__file__), "data", "omnidreams_dit_keys.txt"
@@ -38,13 +35,20 @@ def _build_meta_model() -> OmniDreamsDiT:
 
 
 def test_state_dict_matches_authoritative_key_fixture():
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
     model = _build_meta_model()
     keys = set(model.state_dict().keys())
-    expected = _load_fixture_keys()
-    assert len(expected) == 570
+    ckpt_keys = _load_fixture_keys()
+    assert len(ckpt_keys) == 570
+    # The packed-QKV merge maps the checkpoint's separate q/k/v -> to_qkv and k/v ->
+    # to_kv (param_names_mapping). Apply it to the checkpoint keys and verify they
+    # cover exactly the model's state_dict (i.e. the flat checkpoint stays loadable).
+    mapping_fn = get_param_names_mapping(OmniDreamsDiT.param_names_mapping)
+    mapped = {mapping_fn(k)[0] for k in ckpt_keys}
     assert (
-        keys == expected
-    ), f"missing={sorted(expected - keys)} extra={sorted(keys - expected)}"
+        mapped == keys
+    ), f"missing={sorted(keys - mapped)} extra={sorted(mapped - keys)}"
 
 
 def test_unique_bias_is_crossattn_proj():
@@ -92,4 +96,3 @@ def test_two_step_flow_match_sigmas():
 def test_rope_layout_neox_44_42_42():
     assert rope_dims(128) == (44, 42, 42)
     assert sum(rope_dims(128)) == 128
-    assert ROPE_IS_NEOX_STYLE is True

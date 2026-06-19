@@ -26,72 +26,16 @@ from einops import rearrange
 from torch import Tensor
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
-from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
-
-# RoPE primitives live in omnidreams_rope; re-exported here for callers/tests.
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (  # noqa: F401
-    ROPE_IS_NEOX_STYLE,
-    RotaryPositionEmbedding3D,
-    apply_rope_freqs,
-    rope_dims,
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
 )
-
-
-# ---- TP / distributed helpers (safe to call before distributed init) ------- #
-def _use_tp() -> bool:
-    """True if tensor parallelism is initialised and > 1 rank."""
-    try:
-        from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-
-        return get_tp_world_size() > 1
-    except (ImportError, AssertionError, RuntimeError):
-        return False
-
-
-def _tp_size() -> int:
-    try:
-        from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-
-        return max(1, get_tp_world_size())
-    except (ImportError, AssertionError, RuntimeError):
-        return 1
-
-
-def _tp_col_linear(
-    in_f: int, out_f: int, bias: bool = True, gather_output: bool = False
-):
-    """Column-parallel linear when TP is active, else a plain ``nn.Linear``."""
-    if _use_tp():
-        from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
-
-        return ColumnParallelLinear(in_f, out_f, bias=bias, gather_output=gather_output)
-    return nn.Linear(in_f, out_f, bias=bias)
-
-
-def _tp_row_linear(in_f: int, out_f: int, bias: bool = True):
-    """Row-parallel linear when TP is active, else a plain ``nn.Linear``."""
-    if _use_tp():
-        from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
-
-        return RowParallelLinear(
-            in_f, out_f, bias=bias, reduce_results=True, input_is_parallel=True
-        )
-    return nn.Linear(in_f, out_f, bias=bias)
-
-
-def _divide(a: int, b: int) -> int:
-    """Integer division that asserts divisibility."""
-    q, r = divmod(a, b)
-    if r != 0:
-        raise ValueError(f"{a} is not divisible by {b}")
-    return q
-
-
-def _local_heads(num_heads: int) -> int:
-    """Number of attention heads visible to this TP rank."""
-    return _divide(num_heads, _tp_size())
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import apply_rope_freqs
 
 
 def _sp_size() -> int:
@@ -280,43 +224,50 @@ class OmniDreamsAttention(nn.Module):
         head_dim: int,
     ) -> None:
         super().__init__()
+        self.is_self_attn = context_dim is None
         context_dim = query_dim if context_dim is None else context_dim
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.local_num_heads = _local_heads(n_heads)
-        self._is_tp = _use_tp()
+        self.local_num_heads = divide(n_heads, get_tp_world_size())
 
         inner_dim_full = head_dim * n_heads
-        self.q_proj = _tp_col_linear(
-            query_dim, inner_dim_full, bias=False, gather_output=False
+        if self.is_self_attn:
+            # Self-attn: q/k/v all project from x -> one packed GEMM (q, k, v order).
+            self.to_qkv = MergedColumnParallelLinear(
+                query_dim, [inner_dim_full] * 3, bias=False, gather_output=False
+            )
+        else:
+            # Cross-attn: q from x, k/v from the (text) context -> pack k/v.
+            self.q_proj = ColumnParallelLinear(
+                query_dim, inner_dim_full, bias=False, gather_output=False
+            )
+            self.to_kv = MergedColumnParallelLinear(
+                context_dim, [inner_dim_full] * 2, bias=False, gather_output=False
+            )
+        self.output_proj = RowParallelLinear(
+            inner_dim_full,
+            query_dim,
+            bias=False,
+            reduce_results=True,
+            input_is_parallel=True,
         )
-        self.k_proj = _tp_col_linear(
-            context_dim, inner_dim_full, bias=False, gather_output=False
-        )
-        self.v_proj = _tp_col_linear(
-            context_dim, inner_dim_full, bias=False, gather_output=False
-        )
-        self.output_proj = _tp_row_linear(inner_dim_full, query_dim, bias=False)
         self.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
 
     def _project_qkv(self, x: Tensor, ctx: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Project Q/K/V, handling the TP ColumnParallelLinear return convention."""
-        if self._is_tp:
-            # TP linears (ColumnParallelLinear) return ``(out, bias)`` tuples.
-            q_raw, _ = self.q_proj(x)
-            k_raw, _ = self.k_proj(ctx)
-            v_raw, _ = self.v_proj(ctx)
+        """Project Q/K/V from the packed GEMM(s) (each linear returns ``(out, bias)``)."""
+        if self.is_self_attn:
+            qkv, _ = self.to_qkv(x)
+            q_raw, k_raw, v_raw = (t.contiguous() for t in qkv.chunk(3, dim=-1))
         else:
-            q_raw = self.q_proj(x)
-            k_raw = self.k_proj(ctx)
-            v_raw = self.v_proj(ctx)
+            q_raw, _ = self.q_proj(x)
+            kv, _ = self.to_kv(ctx)
+            k_raw, v_raw = (t.contiguous() for t in kv.chunk(2, dim=-1))
         return q_raw, k_raw, v_raw
 
     def forward(
         self,
         x: Tensor,
-        rope_freqs: Tensor | None = None,
         context: Tensor | None = None,
         kv_cache=None,
         cross_kv: tuple[Tensor, Tensor] | None = None,
@@ -329,10 +280,9 @@ class OmniDreamsAttention(nn.Module):
         a full bidirectional SDPA (scale 1/sqrt(head_dim)). Cross-attention passes
         ``context`` as K/V source and no RoPE.
 
-        When ``rope_cos_sin`` is provided, it dispatches to the fast framework
-        RoPE backend (FlashInfer on CUDA, Triton fallback) instead of computing
-        cos/sin eagerly per-chunk.  The cache format is ``[L, D]`` with the first
-        D/2 columns = cos and the second D/2 = sin.
+        ``rope_cos_sin`` is the ``[L, D]`` cos|sin cache (first D/2 cos, second
+        D/2 sin) from :meth:`RotaryPositionEmbedding3D.shift_t`; self-attention
+        applies NeoX 3D RoPE from it (cross-attention uses no RoPE).
 
         When ``kv_cache`` (a :class:`BlockKVCache`) is given, this is an AR
         self-attention step: the current chunk's post-RoPE K and V are written
@@ -358,7 +308,7 @@ class OmniDreamsAttention(nn.Module):
         if cross_kv is not None:
             # Precomputed cross-attn K/V — skip k_proj/v_proj/k_norm.
             # Q still needs projection since it depends on the current x.
-            q_raw = self.q_proj(x)[0] if self._is_tp else self.q_proj(x)
+            q_raw, _ = self.q_proj(x)
             q = self.q_norm(q_raw.reshape(B, L, n, d))
             k, v = cross_kv
         else:
@@ -368,9 +318,9 @@ class OmniDreamsAttention(nn.Module):
             k = self.k_norm(k_raw.reshape(B, Lk, n, d))
             v = v_raw.reshape(B, Lk, n, d)
 
-        if rope_freqs is not None:
-            q = apply_rope_freqs(q, rope_freqs, cos_sin_cache=rope_cos_sin)
-            k = apply_rope_freqs(k, rope_freqs, cos_sin_cache=rope_cos_sin)
+        if rope_cos_sin is not None:
+            q = apply_rope_freqs(q, rope_cos_sin)
+            k = apply_rope_freqs(k, rope_cos_sin)
         if kv_cache is not None:
             # Write this chunk's (post-RoPE) K/V, then attend over the window.
             kv_cache.update(k, v)
@@ -381,10 +331,8 @@ class OmniDreamsAttention(nn.Module):
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         )
         out = out.transpose(1, 2).reshape(B, L, n * d)
-        if self._is_tp:
-            out, _ = self.output_proj(out)
-            return out
-        return self.output_proj(out)
+        out, _ = self.output_proj(out)
+        return out
 
 
 class OmniDreamsBlock(nn.Module):
@@ -414,9 +362,7 @@ class OmniDreamsBlock(nn.Module):
         self.enable_cross_view_attn = enable_cross_view_attn
         head_dim = x_dim // num_heads
 
-        self.layer_norm_self_attn = LayerNormScaleShift(
-            x_dim, eps=1e-6
-        )
+        self.layer_norm_self_attn = LayerNormScaleShift(x_dim, eps=1e-6)
         self.self_attn = OmniDreamsAttention(x_dim, None, num_heads, head_dim)
 
         # Cross-view attention (Phase 5) — learnable LayerNorm (unlike AdaLN).
@@ -428,9 +374,7 @@ class OmniDreamsBlock(nn.Module):
                 x_dim, x_dim, num_heads, head_dim
             )
 
-        self.layer_norm_cross_attn = LayerNormScaleShift(
-            x_dim, eps=1e-6
-        )
+        self.layer_norm_cross_attn = LayerNormScaleShift(x_dim, eps=1e-6)
         self.cross_attn = OmniDreamsAttention(x_dim, context_dim, num_heads, head_dim)
 
         self.layer_norm_mlp = LayerNormScaleShift(x_dim, eps=1e-6)
@@ -459,7 +403,6 @@ class OmniDreamsBlock(nn.Module):
         x: Tensor,
         emb: Tensor,
         adaln_lora: Tensor | None,
-        rope_freqs: Tensor | None,
         context: Tensor,
         self_attn_kv_cache=None,
         cross_attn_kv: tuple[Tensor, Tensor] | None = None,
@@ -472,7 +415,6 @@ class OmniDreamsBlock(nn.Module):
             x: ``[B, L, D]`` tokens (flat across views & frames).
             emb: ``[B, D]`` timestep embedding.
             adaln_lora: ``[B, 3D]`` AdaLN-LoRA term.
-            rope_freqs: ``[L, 1, 1, head_dim]`` RoPE freqs for self-attention.
             context: ``[B, Lctx, D]`` cross-attention key/value source.
             self_attn_kv_cache: optional :class:`BlockKVCache`.
             cross_attn_kv: optional precomputed ``(K,V)`` tuple for cross-attn.
@@ -529,7 +471,8 @@ class OmniDreamsBlock(nn.Module):
 
         normed = self.layer_norm_self_attn(x, shift_s, scale_s)
         x = x + gate_s * self.self_attn(
-            normed, rope_freqs=rope_freqs, kv_cache=self_attn_kv_cache,
+            normed,
+            kv_cache=self_attn_kv_cache,
             rope_cos_sin=rope_cos_sin,
         )
 
@@ -580,7 +523,17 @@ class OmniDreamsDiT(BaseDiT):
 
     _fsdp_shard_conditions = [lambda n, m: isinstance(m, OmniDreamsBlock)]
     _compile_conditions = [lambda n, m: isinstance(m, OmniDreamsBlock)]
-    param_names_mapping: dict = {}
+    # Route the flat checkpoint's separate q/k/v projections into the packed
+    # MergedColumnParallelLinear params: self-attn q/k/v -> to_qkv (shards 0,1,2 of
+    # 3); cross-attn k/v -> to_kv (shards 0,1 of 2). Cross-attn q_proj and both
+    # output_proj keep their names (no merge).
+    param_names_mapping: dict = {
+        r"^(blocks\.\d+\.self_attn)\.q_proj\.(.*)$": (r"\1.to_qkv.\2", 0, 3),
+        r"^(blocks\.\d+\.self_attn)\.k_proj\.(.*)$": (r"\1.to_qkv.\2", 1, 3),
+        r"^(blocks\.\d+\.self_attn)\.v_proj\.(.*)$": (r"\1.to_qkv.\2", 2, 3),
+        r"^(blocks\.\d+\.cross_attn)\.k_proj\.(.*)$": (r"\1.to_kv.\2", 0, 2),
+        r"^(blocks\.\d+\.cross_attn)\.v_proj\.(.*)$": (r"\1.to_kv.\2", 1, 2),
+    }
     reverse_param_names_mapping: dict = {}
 
     def __init__(
@@ -752,7 +705,7 @@ class OmniDreamsDiT(BaseDiT):
         with ``seq_dim=1`` and shape ``[B, sink+window, local_heads, head_dim]``
         (TP-sharded heads when tensor parallelism is active).
         """
-        n = _local_heads(self.arch.num_heads)
+        n = divide(self.arch.num_heads, get_tp_world_size())
         d = self.arch.model_channels // self.arch.num_heads
         total = sink_tokens + window_tokens
         shape = (batch_size, total, n, d)
@@ -789,16 +742,8 @@ class OmniDreamsDiT(BaseDiT):
         for block in self.blocks:
             attn = block.cross_attn
             n, d = attn.local_num_heads, attn.head_dim
-            k_raw, _ = (
-                attn.k_proj(context) if _use_tp() else (attn.k_proj(context), None)
-            )
-            v_raw, _ = (
-                attn.v_proj(context) if _use_tp() else (attn.v_proj(context), None)
-            )
-            if isinstance(k_raw, tuple):
-                k_raw = k_raw[0]
-            if isinstance(v_raw, tuple):
-                v_raw = v_raw[0]
+            kv, _ = attn.to_kv(context)
+            k_raw, v_raw = (t.contiguous() for t in kv.chunk(2, dim=-1))
             k = attn.k_norm(k_raw.reshape(context.shape[0], context.shape[1], n, d))
             v = v_raw.reshape(context.shape[0], context.shape[1], n, d)
             result.append((k, v))
@@ -844,7 +789,7 @@ class OmniDreamsDiT(BaseDiT):
         guidance=None,
         *,
         condition_video_input_mask: torch.Tensor,
-        rope_freqs: torch.Tensor,
+        rope_cos_sin: torch.Tensor,
         hdmap_condition: torch.Tensor | None = None,
         kv_caches: list | None = None,
         cross_attn_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
@@ -860,9 +805,9 @@ class OmniDreamsDiT(BaseDiT):
             timestep: scalar (warped) timestep; scaled by ``timestep_scale`` here.
             condition_video_input_mask: patchified per-frame condition mask
                 ``[B, L, kt*kh*kw]`` (concatenated onto the latent channels).
-            rope_freqs: ``[L, 1, 1, head_dim]`` 3D-RoPE freqs for self-attention.
-                For AR rollout pass ``shift_t(ar_idx)`` so the chunk is rotated by
-                its absolute temporal position.
+            rope_cos_sin: ``[L, D]`` cos|sin RoPE cache for self-attention. For AR
+                rollout pass ``shift_t(ar_idx)`` so the chunk is rotated by its
+                absolute temporal position.
             hdmap_condition: patchified HDMap ``[B, L, additional_concat_ch*kt*kh*kw]``.
             kv_caches: optional per-block list of :class:`BlockKVCache` (length
                 ``num_blocks``) enabling the autoregressive self-attention window.
@@ -913,22 +858,11 @@ class OmniDreamsDiT(BaseDiT):
             view_embedding_proj = self.adaln_view_proj(view_emb)  # [B, V, 9D]
 
         context = self.crossattn_proj(encoder_hidden_states)
-        # Precompute cos/sin cache once per forward for the fast RoPE path.
-        # The cache stores cos in [:D/2] and sin in [D/2:] for the full
-        # ``[L, D]`` frequency grid, avoiding per-block cos/sin re-computation.
-        rope_cos_sin: Tensor | None = None
-        if rope_freqs is not None:
-            L, D_full = rope_freqs.shape[0], rope_freqs.shape[-1]
-            half = D_full // 2
-            f = rope_freqs[:, 0, 0, :half]  # [L, half]
-            rope_cos_sin = torch.cat([f.cos(), f.sin()], dim=-1)
-
         for i, block in enumerate(self.blocks):
             x = block(
                 x,
                 t_emb,
                 adaln_lora,
-                rope_freqs,
                 context,
                 self_attn_kv_cache=None if kv_caches is None else kv_caches[i],
                 cross_attn_kv=None if cross_attn_kv is None else cross_attn_kv[i],

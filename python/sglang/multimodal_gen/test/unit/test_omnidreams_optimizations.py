@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests for the 4 OmniDreams performance optimizations.
+"""Unit tests for the 4 OmniDreams performance optimizations.
 
 Tests the correctness of:
 - T1: AdaLN fusion (LayerNormScaleShift replacing nn.LayerNorm + manual scale/shift)
-- T2: RoPE kernel (to_cos_sin_cache, fast-path dispatch, B>1 broadcast)
+- T2: RoPE kernel (shift_t cos/sin cache, _apply_rotary_emb dispatch, B>1 broadcast)
 - T3: KV-cache split-copy (no .clone(), correct overlapping-region handling)
 - T4: Text encoder cache (LRU hit/miss, eviction, CPU storage)
 
-All tests are CPU-only; no checkpoint or GPU required.
+No checkpoint required. Most tests are CPU-only; the T1 AdaLN-fusion forward
+checks drive LayerNormScaleShift's fused CuTe/Triton kernel, which is CUDA-only
+(production runs uniformly on cuda; the CPU eager path is not a supported
+target), so they run on the platform device and skip when no GPU is present.
 """
 
-import types
 from collections import OrderedDict
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
@@ -22,19 +25,26 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
     apply_rope_freqs,
 )
 
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+requires_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="LayerNormScaleShift's fused kernel runs on the platform (GPU) device",
+)
 
 # ============================================================================
 # T1: AdaLN Fusion -- LayerNormScaleShift correctness
 # ============================================================================
 
+
+@requires_gpu
 def test_adaln_fusion_matches_old_pattern():
     """LayerNormScaleShift(x, shift, scale) == norm(x) * (1+scale) + shift."""
     torch.manual_seed(0)
     x_dim = 2048
     B, L = 2, 128
-    x = torch.randn(B, L, x_dim)
-    shift = torch.randn(B, 1, x_dim)
-    scale = torch.randn(B, 1, x_dim)
+    x = torch.randn(B, L, x_dim, device=_DEVICE)
+    shift = torch.randn(B, 1, x_dim, device=_DEVICE)
+    scale = torch.randn(B, 1, x_dim, device=_DEVICE)
 
     # Fused path
     fused = LayerNormScaleShift(x_dim, eps=1e-6)
@@ -48,15 +58,16 @@ def test_adaln_fusion_matches_old_pattern():
     assert diff < 1e-5, f"Fused vs manual mismatch: {diff}"
 
 
+@requires_gpu
 def test_adaln_fusion_handles_varied_shapes():
     """LayerNormScaleShift works for single-batch, single-token, and batched inputs."""
     torch.manual_seed(0)
     fused = LayerNormScaleShift(2048, eps=1e-6)
 
     for B, L in [(1, 1), (1, 256), (4, 128), (8, 64)]:
-        x = torch.randn(B, L, 2048)
-        shift = torch.randn(B, 1, 2048)
-        scale = torch.randn(B, 1, 2048)
+        x = torch.randn(B, L, 2048, device=_DEVICE)
+        shift = torch.randn(B, 1, 2048, device=_DEVICE)
+        scale = torch.randn(B, 1, 2048, device=_DEVICE)
         out = fused(x, shift, scale)
         assert out.shape == (B, L, 2048)
         assert torch.isfinite(out).all()
@@ -70,17 +81,23 @@ def test_adaln_fusion_preserves_elementwise_affine_false():
 
 
 # ============================================================================
-# T2: RoPE Kernel -- to_cos_sin_cache, fast path, B>1 broadcast
+# T2: RoPE Kernel -- shift_t cos/sin cache, _apply_rotary_emb, B>1 broadcast
 # ============================================================================
 
-def test_rope_to_cos_sin_cache_format():
-    """to_cos_sin_cache returns [L, D] with cos in [:D/2] and sin in [D/2:]."""
+
+def test_rope_shift_t_cos_sin_format():
+    """shift_t returns the [L, D] cache with cos in [:D/2] and sin in [D/2:]."""
     rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=22, len_w=40, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
-        t_extrapolation_ratio=1.0, device="cpu",
+        head_dim=128,
+        len_h=22,
+        len_w=40,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
+        t_extrapolation_ratio=1.0,
+        device="cpu",
     )
-    cs = rope.to_cos_sin_cache(0)
+    cs = rope.shift_t(0)
     L = 22 * 40 * 2
     assert cs.shape == (L, 128)
     half = 64
@@ -89,78 +106,43 @@ def test_rope_to_cos_sin_cache_format():
     assert identity_error < 1e-6, f"cos^2+sin^2 != 1, error={identity_error}"
 
 
-def test_rope_to_cos_sin_cache_matches_shift_t():
-    """to_cos_sin_cache produces same angles as shift_t -> extract -> cos/sin."""
+def test_rope_works_for_all_ar_offsets():
+    """apply_rope_freqs is finite and norm-preserving at AR offsets 0, 1, 5."""
     torch.manual_seed(0)
     rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
-        t_extrapolation_ratio=1.0,
-    )
-    for ar_idx in (0, 1, 2):
-        freqs = rope.shift_t(ar_idx)  # [L, 1, 1, 128]
-        cs = rope.to_cos_sin_cache(ar_idx)  # [L, 128]
-        half = 64
-        # First half of cs should be cos of shift_t's first half
-        angles = freqs[:, 0, 0, :half]
-        expected_cos = angles.cos()
-        expected_sin = angles.sin()
-        assert torch.allclose(cs[:, :half], expected_cos, atol=1e-6), f"ar_idx={ar_idx} cos mismatch"
-        assert torch.allclose(cs[:, half:], expected_sin, atol=1e-6), f"ar_idx={ar_idx} sin mismatch"
-
-
-def test_rope_fast_path_same_as_fallback():
-    """apply_rope_freqs with cos_sin_cache == apply_rope_freqs without (fallback)."""
-    torch.manual_seed(0)
-    rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
-        t_extrapolation_ratio=1.0,
-    )
-    freqs = rope.shift_t(0)
-    cs = rope.to_cos_sin_cache(0)
-    L = freqs.shape[0]
-
-    for B, H in [(1, 16), (2, 16), (3, 8)]:
-        x = torch.randn(B, L, H, 128)
-        # Fast path
-        out_fast = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=cs)
-        # Fallback path
-        out_fallback = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=None)
-        diff = (out_fast - out_fallback).abs().max().item()
-        assert diff < 1e-5, f"B={B} H={H}: fast vs fallback diff={diff}"
-
-
-def test_rope_fast_path_works_for_all_ar_offsets():
-    """Fast path correct at AR offsets 0, 1, 5."""
-    torch.manual_seed(0)
-    rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
     for ar_idx in (0, 1, 5):
-        freqs = rope.shift_t(ar_idx)
-        cs = rope.to_cos_sin_cache(ar_idx)
-        x = torch.randn(2, freqs.shape[0], 16, 128)
-        out_fast = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=cs)
-        out_fallback = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=None)
-        diff = (out_fast - out_fallback).abs().max().item()
-        assert diff < 1e-5, f"ar_idx={ar_idx}: fast vs fallback diff={diff}"
+        cs = rope.shift_t(ar_idx)
+        x = torch.randn(2, cs.shape[0], 16, 128)
+        out = apply_rope_freqs(x, cs)
+        assert torch.isfinite(out).all(), f"ar_idx={ar_idx}: non-finite output"
+        assert torch.allclose(
+            out.norm(dim=-1), x.norm(dim=-1), atol=1e-4
+        ), f"ar_idx={ar_idx}: norm not preserved"
 
 
-def test_rope_fast_path_preserves_norm():
-    """Cos/sin cache path is norm-preserving (like the original)."""
+def test_rope_preserves_norm():
+    """The cos/sin rotation is norm-preserving (orthogonal rotation per pair)."""
     torch.manual_seed(0)
     rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
-    freqs = rope.shift_t(0)
-    cs = rope.to_cos_sin_cache(0)
-    x = torch.randn(2, freqs.shape[0], 16, 128)
-    out = apply_rope_freqs(x, freqs, cos_sin_cache=cs)
+    cs = rope.shift_t(0)
+    x = torch.randn(2, cs.shape[0], 16, 128)
+    out = apply_rope_freqs(x, cs)
     assert torch.allclose(out.norm(dim=-1), x.norm(dim=-1), atol=1e-4)
 
 
@@ -168,28 +150,34 @@ def test_rope_batch_dimension_broadcast():
     """B>1: each batch element gets the same position-dependent cos/sin."""
     torch.manual_seed(0)
     rope = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
         t_extrapolation_ratio=1.0,
     )
-    freqs = rope.shift_t(0)
-    cs = rope.to_cos_sin_cache(0)
-    L = freqs.shape[0]
+    cs = rope.shift_t(0)
+    L = cs.shape[0]
     B = 4
     x = torch.randn(B, L, 16, 128)
 
-    # Fast path on full batch
-    out_batch = apply_rope_freqs(x.clone(), freqs, cos_sin_cache=cs)
+    # Rotate the full batch at once.
+    out_batch = apply_rope_freqs(x.clone(), cs)
 
-    # Reference: rotate each batch element independently (should match)
+    # Reference: rotate each batch element independently (should match).
     for b in range(B):
-        out_single = apply_rope_freqs(x[b:b+1], freqs, cos_sin_cache=cs)
-        assert torch.allclose(out_batch[b:b+1], out_single, atol=1e-6), f"batch {b} mismatch"
+        out_single = apply_rope_freqs(x[b : b + 1], cs)
+        assert torch.allclose(
+            out_batch[b : b + 1], out_single, atol=1e-6
+        ), f"batch {b} mismatch"
 
 
 # ============================================================================
 # T3: KV-Cache Split-Copy -- no .clone(), correct ordering
 # ============================================================================
+
 
 def _kv_chunk(B, size, n_heads, head_dim, val):
     """Helper: create K/V tensors filled with a constant value."""
@@ -201,8 +189,12 @@ def _kv_chunk(B, size, n_heads, head_dim, val):
 def test_kv_cache_split_copy_steady_state_roll():
     """Split-copy produces the same chunk ordering as the original clone-based approach."""
     c = BlockKVCache(
-        k_shape=(1, 6, 2, 3), v_shape=(1, 6, 2, 3),
-        seq_dim=1, chunk_size=2, window_size=6, sink_size=0,
+        k_shape=(1, 6, 2, 3),
+        v_shape=(1, 6, 2, 3),
+        seq_dim=1,
+        chunk_size=2,
+        window_size=6,
+        sink_size=0,
     )
     # Fill 3 chunks: [10,10], [11,11], [12,12] --> full cache
     for idx, val in enumerate([10, 11, 12]):
@@ -227,20 +219,27 @@ def test_kv_cache_split_copy_steady_state_roll():
 def test_kv_cache_split_copy_no_clone_in_source():
     """Verify BlockKVCache source file has zero .clone() calls in actual code."""
     import inspect
+
     source = inspect.getsource(BlockKVCache._roll_local_window_left)
     # .clone() should not appear in the method body (only possibly in docstrings/comments)
     # Strip comments and check
-    lines = [l for l in source.split('\n') if not l.strip().startswith('#')]
-    code = '\n'.join(lines)
+    lines = [l for l in source.split("\n") if not l.strip().startswith("#")]
+    code = "\n".join(lines)
     # The word "clone" may appear in a comment but not as a .clone() call
-    assert ".clone()" not in code, f".clone() call found in _roll_local_window_left:\n{code}"
+    assert (
+        ".clone()" not in code
+    ), f".clone() call found in _roll_local_window_left:\n{code}"
 
 
 def test_kv_cache_split_copy_overwrite_same_chunk():
     """Re-forward overwrite (same chunk_idx) works with split-copy."""
     c = BlockKVCache(
-        k_shape=(1, 4, 2, 3), v_shape=(1, 4, 2, 3),
-        seq_dim=1, chunk_size=2, window_size=4, sink_size=0,
+        k_shape=(1, 4, 2, 3),
+        v_shape=(1, 4, 2, 3),
+        seq_dim=1,
+        chunk_size=2,
+        window_size=4,
+        sink_size=0,
     )
     for idx, val in enumerate([10, 11]):
         c.before_update(idx)
@@ -264,8 +263,12 @@ def test_kv_cache_split_copy_overlap_handling():
     # chunk=1, window=3: tokens_to_keep=2, copy1=1, copy2=1
     # Layout: [dst0,dst1]=[0,1] [src0,src1]=[1,2] -- dst1 overlaps with src0
     c = BlockKVCache(
-        k_shape=(1, 3, 1, 1), v_shape=(1, 3, 1, 1),
-        seq_dim=1, chunk_size=1, window_size=3, sink_size=0,
+        k_shape=(1, 3, 1, 1),
+        v_shape=(1, 3, 1, 1),
+        seq_dim=1,
+        chunk_size=1,
+        window_size=3,
+        sink_size=0,
     )
     # Fill: [1], [2], [3] -> full cache = [1,2,3]
     for idx, val in enumerate([1, 2, 3]):
@@ -293,8 +296,12 @@ def test_kv_cache_split_copy_overlap_handling():
 def test_kv_cache_split_copy_production_shapes():
     """With OmniDreams production shapes (window=6, chunk=2), split-copy is correct."""
     c = BlockKVCache(
-        k_shape=(1, 6, 16, 128), v_shape=(1, 6, 16, 128),
-        seq_dim=1, chunk_size=2, window_size=6, sink_size=0,
+        k_shape=(1, 6, 16, 128),
+        v_shape=(1, 6, 16, 128),
+        seq_dim=1,
+        chunk_size=2,
+        window_size=6,
+        sink_size=0,
         dtype=torch.float32,
     )
     refs = [torch.randn(1, 2, 16, 128) for _ in range(3)]
@@ -325,6 +332,7 @@ def test_kv_cache_split_copy_production_shapes():
 # a real Qwen2.5-VL model). The test verifies the cache data structure and eviction
 # pattern that OmniDreamsBeforeDenoisingStage._encode_text uses.
 
+
 def test_text_cache_lru_eviction_order():
     """LRU cache evicts oldest entry when full (FIFO-like with move_to_end)."""
     # Simulate the cache data structure and logic from _encode_text
@@ -334,7 +342,7 @@ def test_text_cache_lru_eviction_order():
     for i in range(6):  # Insert 6 entries into a 4-slot cache
         prompt = f"prompt_{i}"
         embeds = torch.tensor([float(i)])  # Stand-in for real embedding
-        
+
         if len(cache) >= max_size:
             cache.popitem(last=False)  # Evict oldest (first inserted)
         cache[prompt] = embeds.detach()
@@ -378,7 +386,7 @@ def test_text_cache_stores_on_cpu():
     """Cached embeddings are stored on CPU to avoid GPU VRAM."""
     cache: OrderedDict[str, torch.Tensor] = OrderedDict()
     embeds = torch.randn(1, 512, 100352)
-    
+
     # Simulate the store logic from _encode_text
     cache["test"] = embeds.detach().cpu()
 
@@ -390,7 +398,7 @@ def test_text_cache_stores_on_cpu():
 def test_text_cache_key_is_prompt_string():
     """Cache key is the raw prompt string; different prompts produce different entries."""
     cache: OrderedDict[str, torch.Tensor] = OrderedDict()
-    
+
     cache["a driving scene"] = torch.zeros(1)
     cache["a rainy scene"] = torch.ones(1)
 
