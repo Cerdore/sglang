@@ -2,11 +2,111 @@
 
 > **Note:** Config fields referenced in historical sections below (`use_fp8_dit`, `use_light_vae_encoder`, etc.) have been replaced by nested Config dataclasses. See [omnidreams_config_migration.md](omnidreams_config_migration.md).
 
-**Date:** 2026-06-18 (updated). **Branch:** `feat/omnidreams-p0-p4b-optimizations`.
+**Date:** 2026-06-19 (updated). **Branch:** `feat/omnidreams-p0-p4b-optimizations`.
 **Dev box:** CPU-only macOS. GPU validation on `rtx6k` (AutoDL container, NVIDIA RTX 6000D 85GB, CUDA 12.8/13.0, torch 2.11.0+cu130). **SSH:** `ssh rtx6k` → AutoDL west-E container.
 
 Plan: `docs/superpowers/omnidreams_optimization_plan.md`. FP8 design: `docs/superpowers/omnidreams_p4_fp8_design.md`. **P4a diagnosis:** [omnidreams_p4a_weight_mapping_diagnosis.md](omnidreams_p4a_weight_mapping_diagnosis.md).
 Reference source (local): `/Users/cerdore/gitRepo/flashdreams`. Checkpoints: `/Users/cerdore/gitRepo/models/{omni-dreams-models/single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt, lighttaew2_1.pth, lightvaew2_1.pth}`.
+
+## 2026-06-19 Update — SM120 architecture research + Phase 7.1/7.2/7.3/7.4 delivered
+
+### SM120 vs SM100 architecture investigation
+
+Web research cross-referenced against primary sources (NVIDIA PTX ISA docs, developer forums, SASS
+disassembly gist, framework PRs) and the native codebase. Key findings committed to project memory
+(`architecture` category):
+
+1. **SM120 = "Ampere + MXFP8 + TMA".** Consumer Blackwell (RTX 5090, RTX Pro 6000) does NOT have
+   `tcgen05`, TMEM, WGMMA, or CTA pairs. The only reliable FP8 tensor-core MMA on SM120 is
+   `mma.sync.aligned.m16n8k32` with MXFP8 block-scale extensions — the same instruction as Ampere-era
+   WMMA. Data-center Blackwell's `tcgen05`/TMEM/UMMA revolution is SM100-only silicon.
+
+2. **sm_120 vs sm_120a = same silicon.** The "a" suffix is a PTX compiler forward-compatibility marker
+   only (NVIDIA staff confirmed on developer forums). It gates arch-conditional MMA atoms in CUTLASS:
+   bare `12.0` compiles them to device-side traps. This is the root cause of the `_normalize_blackwell_arch`
+   requirement.
+
+3. **99 KB shared memory** on SM120 is a regression from SM80's 163 KB — the #1 constraint for kernel
+   tile sizes on consumer Blackwell.
+
+4. **No WGMMA, no tcgen05 anywhere in the native source tree** — verified via grep. The CUTLASS SM120
+   path in `cosmos_fp8_tc_probe.cu` correctly uses `cutlass::arch::Sm120` + `KernelTmaWarpSpecializedBlockwisePingpongSm120`
+   (TMA warp-specialization, NOT UMMA). The VAE path uses inline PTX `mma.sync.aligned`. This is
+   architecturally correct for consumer Blackwell.
+
+5. **Framework impact**: Many frameworks (vLLM TRTLLM MoE, SageAttention) originally gated FP8 kernels
+   on sm_100 only. Fixes are being upstreamed. SGLang's OmniDreams native path was designed correctly
+   for SM120 from the start.
+
+### Phase 7.1: `_normalize_blackwell_arch` unit tests ✅
+
+File: `test/unit/test_singleview_loader.py` (test class: `TestNormalizeBlackwellArch`)
+
+19 test cases covering:
+- **Smoke**: passthrough (empty, non-Blackwell, 12.0a/12.1a already correct, non-sensical tokens)
+- **Bare 12.0/12.1 → 12.0a/12.1a** (single and semicolon-separated)
+- **Multi-arch**: `8.9;12.0 → 8.9;12.0a`, `12.0a;12.1 → 12.0a;12.1a`, 3+ tokens
+- **PTX suffixes**: bare `12.0+PTX`, `12.0a+PTX`, multi-arch with PTX
+- **Comma separator**: coerced to semicolons, mixed comma+semicolon
+- **12.0a already present**: preserved, no double-append
+- **Mixed real/fake tokens**: `7.5;12.0 → 7.5;12.0a`
+- **Synthetic edge**: `12.0;12.0 → 12.0a;12.0a`
+
+All 19 tests pass on macOS CPU.
+
+### Phase 7.2: `_resolve_cuda_arch_list` + `_effective_cuda_arch_list` unit tests ✅
+
+File: same test file, classes `TestResolvedCudaArchList` (8 tests) + `TestEffectiveCudaArchList` (5 tests).
+
+13 test cases covering:
+- **Defaults**: no env vars → returns `12.0a`
+- **`TORCH_CUDA_ARCH_LIST=12.0`** → normalized to `12.0a`
+- **`TORCH_CUDA_ARCH_LIST=12.0a`** → returned as-is (no double-append)
+- **`OMNIDREAMS_SINGLEVIEW_CUDA_ARCH_LIST=12.1`** → normalized to `12.1a`
+- **`OMNIDREAMS_SINGLEVIEW_CUDA_ARCH_LIST=8.9;12.0`** → `8.9;12.0a`
+- **`TORCH_CUDA_ARCH_LIST=12.0a` (already correct)** → `_resolved_cuda_arch_list` returns `None` (no override needed)
+- **`TORCH_CUDA_ARCH_LIST=12.0;9.0`** → `12.0a;9.0`
+- **Only `OMNIDREAMS_SINGLEVIEW_CUDA_ARCH_LIST` set with `12.0;12.0a`** → `12.0a;12.0a`
+- **`TORCH_CUDA_ARCH_LIST` takes precedence** over `OMNIDREAMS_SINGLEVIEW_CUDA_ARCH_LIST`
+
+All 13 tests pass on macOS CPU.
+
+**Edge case discovered during test development**: `os.environ.pop(target_var, None)` (line 273 at
+the time) leaked the global override `TORCH_CUDA_ARCH_LIST="12.0a"` into subsequent test cases.
+The removal was unconditional and did not restore a previous env-var value. Normal `monkeypatch`
+churn could not fix this — the loader's module-level code path executes during `import`, well
+before any test fixture scope. Settled on the resolver as the test boundary (the public API that
+callers actually consume) with explicit env management (restore previous value in `finally`).
+
+### Phase 7.3: `_extension_name` stale .so risk assessment ✅
+
+The `_extension_name()` function (line 220-224) builds a SHA256 hash from:
+1. The source tree fingerprint (content SHAs of all `.cu/.cuh/.h/.hpp/.py` files under the native
+   tree plus thirdparty stamp info)
+2. The thirdparty info JSON dict (`cutlass`/`SageAttention`/`SpargeAttn`/`cudnn-frontend` commits
+   and source SHAs)
+
+The hash does NOT encode the CUDA arch list. This means:
+- Changing `OMNIDREAMS_SINGLEVIEW_CUDA_ARCH_LIST` from `12.0a` to `9.0;12.0a` **reuses the same
+  extension name** → stale `.so` with old arch gets loaded instead of rebuilding for the new arch
+  list.
+- Changing the normalized arch (e.g., 12.0 → 12.0a via `_normalize_blackwell_arch`) is caught
+  because the arch list is embedded as a C-string macro (`OMNIDREAMS_SINGLEVIEW_CUDA_ARCH_LIST`)
+  in the compile flags (line 474-475), and the **source fingerprint includes `singleview_loader.py`**
+  which contains the default `_DEFAULT_CUDA_ARCH_LIST = "12.0a"` constant. So any change to the
+  default is caught. But an env-var-only change is NOT caught — the fingerprint doesn't change.
+- **Risk**: low in practice. The `_scoped_cuda_arch_list` context manager sets `TORCH_CUDA_ARCH_LIST`
+  before the build, so a stale `.so` built for a different arch would have the same name and be
+  silently reused. But the same CUDA arch list is almost always used (default `12.0a` or explicit
+  `TORCH_CUDA_ARCH_LIST`). Changing arch lists is rare and would require manual cache invalidation.
+  The `.so` cache is in `build/torch_extensions/` under a content-addressed directory — users can
+  `rm -rf` it if needed.
+
+### Phase 7.4: SM120 guard removal ✅
+
+Previously completed (2026-06-18, documented in Phase table). The guard that permanently disabled
+native FP8 on first transient error was removed. The fix: retry every call instead of setting
+`_native_disabled = True`. Verified: extension loads successfully on rtx6k.
 
 ## 2026-06-18 Update — Native FP8 ext **BUILDS on rtx6k** (sm_120a), Sage3/Sparge claim refuted
 
@@ -104,16 +204,43 @@ FP8 懒量化（首次 `__call__` 时在 GPU 热路径上现烤 FP8 权重）是
 **验证路径（Phase 4）**：关掉 eager 侧的 compile/graph，同一条件对比；或用 warmup+多 chunk
 排除首 chunk 的注入开销，只取稳态 chunk 的 C++ kernel 纯耗时。
 
-### Phase 2.3/2.4（sage3_fp8/sparge）⚠️ 阻滞 — Sage3 FP4 交叉注意力缓存未集成
+### Phase 2.3/2.4（sage3_fp8/sparge）⚠️ 阻滞 — 实测归因修正（2026-06-19，chen E2E 探针）
 
-`sage3_fp8` 和 `sparge` 后端跑到两个 C++ 错误后阻滞：
+> **历史归因已作废。** 之前的"两个 C++ 错误（`k_cross_fp8_caches` 缺失 / FP4 交叉注意力缓存未集成）"并非真实根因——那是在 rtx6k（85GB）上以未实测的代码路径推断的。2026-06-19 在 chen（RTX 5070 12GB sm_120，cuda-13.0 完整 toolkit）上跑了真实 E2E 探针（`/tmp/sage3_e2e_probe.py`，backend ∈ {cudnn_bf16, sparge, sage3_fp8}），实测揭示三层阻滞，与之前推断全然不同。`k_cross_fp8_caches` 注入（`omnidreams_fp8.py:282-320`）本身是对的，但它根本没被触发——阻滞发生在更早的层面。
 
-1. `cosmos_kv_cache_backend=fp8 requires config['k_cross_fp8_caches']`
-   → 已修复（动态注入 FP8 KV cache tensors）
-2. `Sage3 FP8 attention requires Sage3 FP4 cross-attention caches`
-   → **未修复**——需要把 `sage3_quantize_cross_kv_bf16` 调用链从 vendored
-   `_ensure_fp8_runtime`（`optimized_dit.py:1174-1341`）搬到 SGLang 的 `__call__`。
-   工作量：~50 行 Python + 确认 sage3 的 `.so` 符号正确导出。
+**测试环境（chen）**：RTX 5070, sm_120, 12GB；`/home/chen/gitRepo/sglang` → `/mnt/e/gitRepo/sglang` 符号链接（单份 repo）；nvidia-smi 在 `/usr/lib/wsl/lib`；`/usr/local/cuda-13.0`（nvcc 13.0.88，完整 toolkit，非 pip 拼凑）；已编译 `.so` 在 `.../build/torch_extensions/omnidreams_singleview_native_622ebb11dcfa/`。3rdparty 全部填充（cutlass 13272 文件、SpargeAttn 112、SageAttention 172、cudnn-frontend 207）——**之前"3rdparty 全空"的结论是 `cd` 失败导致的假报警，已作废**。
+
+**阻塞 #1（最致命，与 backend 无关）🔴 — chen 12GB 显存根本不够**
+- **cudnn_bf16（最省显存 backend）都 OOM**，在 `OmniDreamsBeforeDenoisingStage` 的 `component_resident_strategies.py:437` `prefetch_for_use` → `module.to(device)`（把下一个组件，疑似 DiT 本体，prefetch 上 GPU 时失败）。
+- sparge 在更晚的 `omnidreams_fp8.py:260` `_make_cosmos_streaming_workspace` 处 OOM（PyTorch 报 15.82GB 已分配 / 11.94GB 总量）。
+- 已设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，cudnn 仍 OOM。
+- 720p FP8 DiT（2.06B 参数 + KV cache + workspace）在 12GB 装不下。**这层阻塞优先于一切 backend 工作**——backend 解了也跑不动。
+- `u8_specs`（FP8 scratch，所有 backend 共享，含 cudnn）单项可达 ~700MB×2（`attn_k/v_fp8`，max_attn_tokens=6·176·320=337920），`linear_fp8_scratch` ~923MB；sparge 再加 ~2GB `sparge_workspace_bytes`。
+
+**阻塞 #2（sparge）🟡 — SpargeAttn 没有 sm_120 内核**
+- vendored `sparge_attention_sm89_inst.cu`（43 行）是**编译期 stub**：`launch_sparge_attention_sm89_hd128(...) { return cudaErrorNotSupported; }`。
+- `sparge_is_built()` 绑定（`streaming_dit_bindings.cpp:38`）返回 `#ifdef HAS_SPARGE ? true : false`，而 `singleview_loader.py:457/500` 设 `HAS_SPARGE=1` → **sparge 通过 Python 状态门控**（`_sparge_status` 返回 True），直接进入内核 → 撞 `cudaErrorNotSupported`。
+- 真 SpargeAttn 第三方源码**在**（`3rdparty/SpargeAttn/csrc/qattn/`），但只有 `qk_int_sv_f8_cuda_sm80.cu`、`_sm89.cu`、`_sm90.cu`，`fused/fused.cu`——**无 Blackwell sm_120 内核**。vendored stub 名字就叫 `sm89`。
+- 解除 = 写/移植一个 sm_120 sparge 内核（大工程，超出当前范围）。
+
+**阻塞 #3（sage3，最易解除）🟢 — 双重 stub + 白名单**
+- `singleview_loader.py:191` 列 `sage3_attention_stub.cu`（工作区改动，未提交；`git diff HEAD` 可见 `sage3_attention.cu` → `sage3_attention_stub.cu`）。
+- `:456/499` 设 `-DOMNIDREAMS_SINGLEVIEW_HAS_SAGE3=0`。
+- 真 `sage3_attention.cu`（35640B）就在仓库：**自包含真实实现**——真 `sage3_is_built()=true`（line 616）、真 `sage3_is_runtime_supported()`（line 618）、真 FMHA（`run_sage3_fmha_packed_qkv_fp4` line 861）、真 FP4 量化内核（`fp8_scaled_fp4_quant_kernel`、`bf16_q_to_sage3_fp4_kernel`）。只依赖 `attention.cuh`+cutlass，无外部 sage 库。
+- **但** `sage3_is_runtime_supported()` 白名单只允许 `RTX 5090`/`RTX PRO 6000`/`RTX 6000`，**不含 RTX 5070** → 返回 false。原因（代码注释）：sm_120a 的 arch-conditional FP4 MMA 需 `a` 后缀，CUDA 运行时不暴露该后缀，无法程序化区分 sm_120a vs sm_120，故硬编码已验证 SKU。RTX 5070 是消费级 Blackwell（GB206），实际为 sm_120a，加白名单是合理但**未验证**的改动。
+- `_sage3_status()`（`optimized_dit.py:886`）因 stub .so 的 `sage3_is_built()=false` 在内核前拦截——这就是探针报的"native_extension was built with Sage3 stubs"。
+
+**解除路径与代价评估（仅诊断，未动手）**：
+| 阻塞 | 解除动作 | 代价 | 是否同时缓解 #1 OOM |
+|------|---------|------|-------------------|
+| #1 OOM | 降分辨率/workspace 或换大显存机器 | 中（需调参）或 0（换机器） | — |
+| #2 sparge sm_120 | 写/移植 sm_120 sparge 内核 | **高（新内核）** | 否（FP8 KV，比 cudnn 省但比 sage3 大） |
+| #3 sage3 门控 | 改回真 .cu + `HAS_SAGE3=1` + 白名单加 5070 | **低（3 处改动+重建）** | **可能**（FP4 KV 最小，唯一可能 fit 12GB） |
+
+**关键判断**：sage3 用 FP4 KV cache（三者最小），是唯一可能同时解决 backend 门控 **和** 缓解 OOM 的路径。若选在 chen 上推进，应优先解 #3 并实测 sage3 是否 fit 12GB；若 OOM 仍成立，则需换 rtx6k（85GB）或降分辨率。sparge 因无 sm_120 内核，短期不可行。
+
+**探针产物**（chen `/tmp/`）：`sage3_e2e_probe.py`、`cfg_sage3_fp8.json`、`cfg_sparge.json`、`cfg_cudnn_bf16.json`、`probe_sparge.log`、`probe_cudnn.log`。详见 `docs/superpowers/omnidreams_pro6000_test_plan.md`。
+
 
 ### 测试计划完整状态（2026-06-18 收盘）
 
@@ -123,8 +250,8 @@ FP8 懒量化（首次 `__call__` 时在 GPU 热路径上现烤 FP8 权重）是
 | 1 — 构建正确性 | ✅ | `.so` arch=sm_120a, 45MB, Sage3/Sparge 编入 |
 | 2.1 — eager BF16 基线 | ✅ | Denoising **2.29s**, 总 16.32s |
 | 2.2 — FP8 + cudnn_bf16 | ✅ | Denoising **5.28s**, 总 ~21s, **离线预量化主路径** |
-| 2.3 — FP8 + sage3_fp8 | ⚠️ 阻滞 | 缺 Sage3 FP4 交叉注意力缓存集成 |
-| 2.4 — FP8 + sparge | ⚠️ 阻滞 | 同上 |
+| 2.3 — FP8 + sage3_fp8 | ⚠️ 阻滞 | 实测三层：stub .cu+HAS_SAGE3=0（工作区改动，可还原）+白名单无 5070；chen 12GB cudnn 都 OOM（见上节）|
+| 2.4 — FP8 + sparge | ⚠️ 阻滞 | vendored stub 返回 NotSupported；真 SpargeAttn 无 sm_120 内核（仅 sm80/89/90）；同 OOM |
 | 2.5 — 关全部 CPU offload | ⬜ | 需理顺 JSON config 传递路径 |
 | 2.6 — compile + warmup | ✅ | eager BF16, warmup 后 **16.01s** |
 | 2.7 — server 模式 | ✅ | 加载 FP8 config, Uvicorn healthy |
@@ -134,14 +261,14 @@ FP8 懒量化（首次 `__call__` 时在 GPU 热路径上现烤 FP8 权重）是
 | 4 — 性能基线 | ⬜ | 需 warmup+多 chunk+`--perf-dump-path` 隔离首次开销 |
 | 5 — Profiling | ⬜ | 找 C++ kernel 热点 |
 | 6 — 压力规模 | ⬜ | 1080p, 49f, 多请求 |
-| 7.1/7.2 — arch 归一化 UT | ⬜ | `_normalize_blackwell_arch` 单元测试 |
-| 7.3 — 过期 .so footgun | ⬜ | `_extension_name` 不编码 arch 的风险评估 |
+| 7.1/7.2 — arch 归一化 UT | ✅ | `_normalize_blackwell_arch` 单元测试 (19 cases) + `_resolve_cuda_arch_list`/`_effective_cuda_arch_list` resolver tests (13 cases), all 32 green |
+| 7.3 — 过期 .so footgun | ✅ | `_extension_name` 不编码 arch 的风险评估完成 (low risk, manual cache invalidation if arch list changes) |
 | 7.4 — sm_120 guard | ✅ | 已彻底移除 |
 | 7.5 — generate_stats fix | ✅ | attention.cu 中 2 处 |
 | 7.6 — clean checkout | ✅ | 可重建+跑通 |
 
 **P0 最小集完成度：~65%（12/19 项）。** 核心交付物（离线预量化全链路）已验证通过。
-阻滞项（sage3_fp8/sparge）非本方案范围；剩余 ⬜ 项为扩展性/深度验证，无新增代码风险。
+阻滞项（sage3_fp8/sparge）已实测归因（2026-06-19）：**首要阻塞是 chen 12GB OOM（cudnn_bf16 都过不了 BeforeDenoisingStage）**，backend 门控问题（sage3 双重 stub+白名单 / sparge 无 sm_120 内核）在其后。诊断详见上节，未改代码。剩余 ⬜ 项为扩展性/深度验证，无新增代码风险。
 
 ## CPU test invariant (IMPORTANT)
 - venv python: `/Users/cerdore/.python/sglang/bin/python` (torch 2.9.0, editable sglang).
