@@ -9,6 +9,7 @@ under ``multimodal_gen/native/omnidreams_singleview/``.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,7 @@ class _NativeHandles:
 def _load_native(mode: str = "auto") -> _NativeHandles | None:
     if mode == "disabled":
         return None
+
     try:
         from sglang.multimodal_gen.native import load_extension
         from sglang.multimodal_gen.native.singleview_loader import load_python_module
@@ -104,7 +106,14 @@ class _ExecConfig:
 
 
 class _SGLTransformerAdapter:
-    """Presents SGLang's ``OmniDreamsDiT`` as the FlashDreams ``transformer``."""
+    """Presents SGLang's OmniDreamsDiT as the FlashDreams transformer.
+
+    SGLang handles patch/unpatch and cache-init at the stage level, so the
+    vendored ``_release_network_after_fp8_snapshot`` (which replaces
+    ``self.network`` with a lightweight shape-ops stub) is short-circuited
+    here via ``_released_network_for_fp8``.  This keeps the adapter pointing
+    at the real ``OmniDreamsDiT`` for the lifetime of the process.
+    """
 
     def __init__(self, sgl_dit: Any, arch: Any, len_t: int, dtype: torch.dtype,
                  height: int, width: int) -> None:
@@ -114,6 +123,14 @@ class _SGLTransformerAdapter:
         self._output_width = int(width)
         self._use_cuda_graph = False
         self._cuda_graph_capture_ar_idx = 0
+
+    @property
+    def _released_network_for_fp8(self) -> bool:
+        return True
+
+    @_released_network_for_fp8.setter
+    def _released_network_for_fp8(self, value: bool) -> None:
+        pass
 
     def _maybe_inject_image(self, latent, cache):
         return latent
@@ -130,7 +147,8 @@ class OmniDreamsFP8DiT:
 
     def __init__(self, sgl_dit: Any, arch: Any, native: _NativeHandles, *,
                  attention_backend: str = "auto", sparge_topk: float | None = None,
-                 dit_backend: str = "fp8_kvcache_cudnn") -> None:
+                 dit_backend: str = "fp8_kvcache_cudnn",
+                 fp8_prepared_weights: dict | None = None) -> None:
         self._native = native
         self._arch = arch
         self._sgl_dit = sgl_dit
@@ -138,6 +156,10 @@ class OmniDreamsFP8DiT:
         self._sparge_topk = sparge_topk
         self._dit_backend = dit_backend
         self._executor: Any | None = None
+        # Pre-quantized weights (CPU dict from torch.load). Held as a CPU ref
+        # during init (DiT may still be offloaded). Moved to GPU inside
+        # _ensure_executor at first __call__, when the device is known.
+        self._prepared_weights = fp8_prepared_weights
 
     def _ensure_executor(self, len_t: int, height: int, width: int) -> Any:
         if self._executor is None:
@@ -151,6 +173,16 @@ class OmniDreamsFP8DiT:
                 attention_backend=self._attention_backend,
                 sparge_topk=self._sparge_topk,
             )
+            # Inject pre-quantized weights so _ensure_weights_snapshot()
+            # finds them on first call and skips all quantization work.
+            assert self._prepared_weights is not None, \
+                "FP8 prepared weights missing; build_fp8_dit must inject them"
+            device = next(self._sgl_dit.parameters()).device
+            self._executor._optimized_weights = {
+                k: v.to(device=device).contiguous() if isinstance(v, torch.Tensor) else v
+                for k, v in self._prepared_weights.items()
+            }
+            self._prepared_weights = None  # release CPU ref
         return self._executor
 
     @torch.inference_mode()
@@ -192,16 +224,6 @@ class OmniDreamsFP8DiT:
         inv = ex._ensure_invariant_tensors(ar_idx=ar_idx, timesteps=timestep_b)
         rope_cos, rope_sin = ex._ensure_rope_tensors(ar_idx=ar_idx, rope_freqs=rope_freqs)
         ex._ensure_weights_snapshot()
-        # SGLang fused the pad-mask channel out of x_embedder (72→68), but
-        # the native kernel expects 72-ch. Replace with identity+zeros so
-        # already-embedded tokens pass through unchanged.
-        _xe = ex._optimized_weights.get("x_embedder.proj.1.weight")
-        if _xe is not None and _xe.shape[1] != D + 4:
-            ex._optimized_weights["x_embedder.proj.1.weight"] = torch.nn.functional.pad(
-                torch.eye(D, dtype=_xe.dtype, device=_xe.device), (0, 4)
-            )
-            ex._optimized_weights.pop("x_embedder.proj.1.weight_fp8_prepared", None)
-            ex._optimized_weights.pop("x_embedder.proj.1.weight_fp8_prepared_scale", None)
 
         k_self = [c._k for c in kv_caches]
         v_self = [c._v for c in kv_caches]
@@ -218,6 +240,94 @@ class OmniDreamsFP8DiT:
             hdmap_in if hdmap_embed is None
             else ex._empty_hdmap_tensor(device=noisy.device, dtype=ext_dtype)
         )
+
+        # Inject runtime config + workspace (mirrors _ensure_fp8_runtime which
+        # is normally bypassed in the SGLang fast path — see call trace doc).
+        ex._resolve_runtime_attention_backend(noisy.device)
+        # Map Python-side attention names to C++ bridge names
+        _PY_TO_CPP_ATTN = {"cudnn": "cudnn_bf16"}
+        attn_backend = _PY_TO_CPP_ATTN.get(ex._attention_backend, ex._attention_backend)
+        # KV cache backend: FP8 for sage3_fp8/sparge (native FP8 attention),
+        # BF16 for cudnn_bf16 (cuDNN FMHA with BF16 KV cache).
+        use_fp8_kv = attn_backend in ("sage3_fp8", "sparge")
+        kv_backend = "fp8" if use_fp8_kv else "bf16"
+        tokens = int(T * HW)
+        # max_attn_tokens = max sequence length across all KV caches (self + cross)
+        max_attn_tokens = tokens
+        for tlist in (k_self, k_cross):
+            for t in tlist:
+                max_attn_tokens = max(max_attn_tokens, int(t.size(1)))
+        workspace = self._native.optimized_dit._make_cosmos_streaming_workspace(
+            batch=int(k_self[0].size(0)),
+            tokens=tokens,
+            max_attn_tokens=max_attn_tokens,
+            num_blocks=int(self._arch.num_blocks),
+            model_channels=int(self._arch.model_channels),
+            heads=n_heads,
+            ff=int(4 * self._arch.model_channels),
+            lora_dim=int(getattr(self._arch, "adaln_lora_dim", 256)),
+            device=noisy.device,
+            dtype=torch.bfloat16,
+            use_sage3_fp8_attention=(attn_backend == "sage3_fp8"),
+            use_sparge_attention=(attn_backend == "sparge"),
+            sparge_topk_ratio=self._sparge_topk if self._sparge_topk else 0.25,
+        )
+        # Build KV cache tensors in the layout the C++ bridge expects.
+        # Mirrors vendored ``_ensure_fp8_runtime`` (optimized_dit.py:1203-1269).
+        use_sage3 = attn_backend == "sage3_fp8"
+        extra_config: dict[str, Any] = {}
+        k_cross_fp8: list[torch.Tensor] = []
+        v_cross_fp8: list[torch.Tensor] = []
+
+        if use_sage3:
+            # Sage3 FP8 attention needs FP4 cross-attn KV + scale factors.
+            sage3_cross = [
+                self._native.extension.sage3_quantize_cross_kv_bf16(k, v)
+                for k, v in zip(k_cross, v_cross, strict=True)
+            ]
+            extra_config["k_cross_sage3_fp4_caches"] = [
+                tensors[0] for tensors in sage3_cross
+            ]
+            extra_config["v_cross_sage3_fp4_caches"] = [
+                tensors[1] for tensors in sage3_cross
+            ]
+            extra_config["k_cross_sage3_sf_caches"] = [
+                tensors[2] for tensors in sage3_cross
+            ]
+            extra_config["v_cross_sage3_sf_caches"] = [
+                tensors[3] for tensors in sage3_cross
+            ]
+            # k/v_cross_fp8 stay empty: Sage3 consumes FP4 directly.
+        elif use_fp8_kv:
+            # Sparge / generic FP8 attention path.
+            k_cross_fp8 = [
+                t.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
+                for t in k_cross
+            ]
+            v_cross_fp8 = [
+                t.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
+                for t in v_cross
+            ]
+
+        if use_fp8_kv:
+            extra_config["k_cross_fp8_caches"] = k_cross_fp8
+            extra_config["v_cross_fp8_caches"] = v_cross_fp8
+            extra_config["k_self_fp8_caches"] = [
+                torch.zeros_like(t, dtype=torch.uint8) for t in k_self
+            ]
+            extra_config["v_self_fp8_caches"] = [
+                torch.zeros_like(t, dtype=torch.uint8) for t in v_self
+            ]
+
+        ex._apply_runtime_config({
+            "cosmos_linear_backend": "fp8",
+            "cosmos_attention_backend": attn_backend,
+            "cosmos_kv_cache_backend": kv_backend,
+            "cosmos_quantized_prepared": True,
+            "cosmos_workspace": workspace,
+            **extra_config,
+        })
+
         out = ex._predict_flow_ext_impl(
             noisy, mask, hdmap_for_ext, hdmap_embed, timestep_b, rope_freqs,
             inv.t_emb, inv.t_emb_silu, inv.adaln_lora, inv.final_shift, inv.final_scale,
@@ -232,6 +342,7 @@ def build_fp8_dit(
     arch: Any,
     *,
     mode: str,  # Required: "auto" | "disabled" | "required"
+    fp8_prepared_path: str | None = None,
     attention_backend: str = "auto",
     sparge_topk: float | None = None,
 ) -> OmniDreamsFP8DiT | None:
@@ -240,16 +351,38 @@ def build_fp8_dit(
     Args:
         mode: "auto" (try, fallback on failure), "required" (raise on failure),
               "disabled" (return None).
+        fp8_prepared_path: Path to pre-quantized FP8 weights (.pt from the
+            offline exporter). Required for ``mode="required"``; for
+            ``mode="auto"`` the caller falls back to eager DiT when the file
+            is missing.
     """
     if mode == "disabled":
         return None
     native = _load_native(mode)
     if native is None:
         return None
+
+    fp8_weights = None
+    if fp8_prepared_path and os.path.exists(fp8_prepared_path):
+        payload = torch.load(fp8_prepared_path, map_location="cpu", weights_only=True)
+        fp8_weights = payload["weights"]  # meta validation done by caller (DenoisingStage)
+
+    if fp8_weights is None:
+        if mode == "required":
+            raise FileNotFoundError(
+                f"FP8 prepared weights not found at {fp8_prepared_path!r}. "
+                "Run: python -m sglang.multimodal_gen.tools."
+                "export_omnidreams_fp8_dit_weights "
+                "--checkpoint <path> --output <path>"
+            )
+        # auto mode without file → return None, DenoisingStage falls back to eager
+        return None
+
     return OmniDreamsFP8DiT(
         sgl_dit,
         arch,
         native,
         attention_backend=attention_backend,
         sparge_topk=sparge_topk,
+        fp8_prepared_weights=fp8_weights,
     )

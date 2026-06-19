@@ -1160,6 +1160,7 @@ cudaError_t run_cudnn_fmha_packed_qkv(
     float attn_scale = (scale > 0.f) ? scale : (1.0f / sqrtf(float(D)));
     auto sdpa_opts = fe::graph::SDPA_attributes()
                          .set_name("packed_sdpa")
+                         .set_generate_stats(false)  // inference: no softmax LSE; required by cudnn-frontend v1.x
                          .set_attn_scale(attn_scale)
                          .set_causal_mask(causal);
 

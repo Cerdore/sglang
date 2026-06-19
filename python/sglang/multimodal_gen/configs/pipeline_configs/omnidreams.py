@@ -90,6 +90,10 @@ class OmniDreamsPipelineConfig(PipelineConfig):
 
     # DiT FP8 three-state mode (kept as flat fields, not a nested Config).
     native_dit_acceleration: NativeAccelerationMode = "disabled"
+    # Explicit path to pre-quantized FP8 DiT weights (.pt from the offline
+    # exporter).  When None the DenoisingStage infers a default alongside the
+    # raw checkpoint (omnidreams_fp8_dit.pt).
+    native_dit_fp8_prepared_path: str | None = None
     native_dit_backend: str = "auto"
     # Block-sparse top-k ratio for the "sparge" attention backend (0, 1].
     fp8_dit_sparge_topk: float | None = None

@@ -27,6 +27,7 @@ A remaining HD-map VAE-encode numerics note is flagged inline with ``TODO(gpu)``
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 
 import PIL.Image
@@ -900,10 +901,68 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                     "(the native FP8 op manages its own CUDA graph)."
                 )
                 cuda_graph_runner = None
+
+            # Resolve fp8_prepared_path: explicit config wins, else infer
+            # alongside the raw checkpoint.
+            model_path = server_args.model_path
+            fp8_prepared_path = getattr(config, "native_dit_fp8_prepared_path", None)
+            if fp8_prepared_path is None:
+                if os.path.isfile(model_path):
+                    ckpt_dir = os.path.dirname(model_path)
+                else:
+                    ckpt_dir = model_path
+                fp8_prepared_path = os.path.join(ckpt_dir, "omnidreams_fp8_dit.pt")
+
+            # Lightweight fingerprint check: if the pre-quantized file exists
+            # but the raw checkpoint has a newer mtime, warn and fall back
+            # (or error for required mode) — avoids silently using stale
+            # quantized weights after a checkpoint upgrade.
+            if os.path.exists(fp8_prepared_path):
+                try:
+                    payload = torch.load(
+                        fp8_prepared_path, map_location="cpu", weights_only=True
+                    )
+                    meta = payload.get("meta", {})
+                    fp = meta.get("checkpoint_fingerprint", {})
+                    # Resolve raw checkpoint path for fingerprint comparison
+                    _DEFAULT_CKPT_RELPATH = "single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt"
+                    if os.path.isfile(model_path):
+                        raw_path = model_path
+                    else:
+                        raw_path = os.path.join(model_path, _DEFAULT_CKPT_RELPATH)
+                    if os.path.exists(raw_path):
+                        ckpt_stat = os.stat(raw_path)
+                        if (fp.get("file_size") != ckpt_stat.st_size
+                                or fp.get("mtime") != ckpt_stat.st_mtime):
+                            logger.warning(
+                                "OmniDreams: FP8 prepared weights fingerprint "
+                                "mismatch (checkpoint may have been updated). "
+                                "Re-run: python -m sglang.multimodal_gen.tools."
+                                "export_omnidreams_fp8_dit_weights "
+                                "--checkpoint %s --output %s",
+                                raw_path, fp8_prepared_path,
+                            )
+                            if mode == "required":
+                                raise RuntimeError(
+                                    "FP8 prepared weights fingerprint mismatch. "
+                                    "Re-run the offline exporter."
+                                )
+                            fp8_prepared_path = None  # force fallback / skip
+                except Exception:
+                    # Corrupt or old-format file — treat as missing.
+                    logger.warning(
+                        "OmniDreams: failed to read FP8 prepared weights at %s; "
+                        "treating as missing.", fp8_prepared_path
+                    )
+                    if mode == "required":
+                        raise
+                    fp8_prepared_path = None
+
             fp8_dit = build_fp8_dit(
                 self.transformer,
                 arch,
                 mode=mode,
+                fp8_prepared_path=fp8_prepared_path,
                 attention_backend=getattr(config, "native_dit_backend", "auto"),
                 sparge_topk=getattr(config, "fp8_dit_sparge_topk", None),
             )

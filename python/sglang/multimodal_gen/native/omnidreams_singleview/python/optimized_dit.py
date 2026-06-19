@@ -1077,41 +1077,17 @@ class OptimizedDiTExecutor:
 
     def _ensure_weights_snapshot(self) -> dict[str, Tensor]:
         """Snapshot ``self.network.state_dict()`` once. Idempotent."""
-        if self._optimized_weights is None:
-            state_dict = self.network.state_dict()
-            self._snapshot_cross_cache_weights(state_dict)
-            if self._uses_fp8_dit:
-                from cosmos_fp8_utils import (
-                    prepare_cosmos_quantized_streaming_weights,
-                )
-
-                device = next(self.network.parameters()).device
-                # Quantize from CPU so one-time FP32/FP8 conversion temporaries
-                # do not coexist on the GPU with the full BF16 DiT, VAE, TAE,
-                # and CUDA graph pools during block 0.
-                cpu_state = {
-                    key: value.detach().cpu() for key, value in state_dict.items()
-                }
-                # Do not keep the GPU state_dict view alive across the later
-                # network release; its tensor refs would mask the freed memory.
-                del state_dict
-                self._optimized_weights = prepare_cosmos_quantized_streaming_weights(
-                    cpu_state,
-                    num_blocks=self.config.network.num_blocks,
-                    device=None,
-                    linear_policy="all",
-                )
-                self._drop_redundant_bf16_prepared_weights()
-                self._optimized_weights = {
-                    key: value.to(device=device).contiguous()
-                    if isinstance(value, torch.Tensor)
-                    else value
-                    for key, value in self._optimized_weights.items()
-                }
-                del cpu_state
-                self._release_network_after_fp8_snapshot()
-            else:
-                self._optimized_weights = prepare_cosmos_streaming_weights(state_dict)
+        if self._optimized_weights is not None:
+            return self._optimized_weights
+        if self._uses_fp8_dit:
+            raise RuntimeError(
+                "FP8 weights not injected. Run the offline exporter and pass "
+                "fp8_prepared_path through build_fp8_dit()."
+            )
+        # Non-FP8 (bf16 native) path retained as-is.
+        state_dict = self.network.state_dict()
+        self._snapshot_cross_cache_weights(state_dict)
+        self._optimized_weights = prepare_cosmos_streaming_weights(state_dict)
         return self._optimized_weights
 
     def _snapshot_cross_cache_weights(self, state_dict: Mapping[str, Tensor]) -> None:

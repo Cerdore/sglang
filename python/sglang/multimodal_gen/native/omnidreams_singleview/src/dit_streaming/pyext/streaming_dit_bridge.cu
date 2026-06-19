@@ -254,9 +254,19 @@ static cudaError_t cosmos_fp8_batched_rcr_gemm(
         batch_count);
 
     cutlass::Status status = gemm_op.initialize(args, nullptr, stream);
-    if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    if (status != cutlass::Status::kSuccess) {
+        std::fprintf(stderr,
+            "[DIAG] attn_batched_gemm init FAIL | batches=%d M=%d N=%d K=%d | status=%s\n",
+            batch_count, m, n, k, cutlass::cutlassGetStatusString(status));
+        return cudaErrorUnknown;
+    }
     status = gemm_op(stream);
-    if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    if (status != cutlass::Status::kSuccess) {
+        std::fprintf(stderr,
+            "[DIAG] attn_batched_gemm run FAIL | batches=%d M=%d N=%d K=%d | status=%s\n",
+            batch_count, m, n, k, cutlass::cutlassGetStatusString(status));
+        return cudaErrorUnknown;
+    }
     return cudaSuccess;
 }
 

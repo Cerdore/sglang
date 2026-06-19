@@ -245,16 +245,46 @@ def _resolved_max_jobs(max_jobs: int | str | None) -> str | None:
     return str(min(os.cpu_count() or 1, _DEFAULT_MAX_JOBS_CAP))
 
 
+def _normalize_blackwell_arch(arch_list: str) -> str:
+    """Force the arch-specific ``a`` target on consumer Blackwell tokens.
+
+    The FP8 CUTLASS GEMMs use arch-conditional MMA atoms that only resolve to
+    real instructions under ``sm_120a`` (consumer Blackwell: RTX 50xx / RTX PRO
+    6000).  A bare ``12.0``/``12.1`` token compiles them to a device-side trap
+    ("Arch conditional MMA instruction used without targeting appropriate
+    compute capability"), aborting at the first FP8 GEMM.  Normalize those
+    tokens (``12.0`` -> ``12.0a``, ``8.9;12.0`` -> ``8.9;12.0a``); leave every
+    other token untouched.
+    """
+    tokens: list[str] = []
+    for raw in arch_list.replace(",", ";").split(";"):
+        tok = raw.strip()
+        if not tok:
+            continue
+        base, sep, ptx = tok.partition("+")
+        if base in ("12.0", "12.1"):
+            base += "a"
+        tokens.append(base + sep + ptx)
+    return ";".join(tokens)
+
+
 def _resolved_cuda_arch_list() -> str | None:
-    if os.environ.get(_PYTORCH_CUDA_ARCH_LIST_ENV):
-        return None
-    return os.environ.get(_NATIVE_CUDA_ARCH_LIST_ENV, _DEFAULT_CUDA_ARCH_LIST)
+    env = os.environ.get(_PYTORCH_CUDA_ARCH_LIST_ENV)
+    if env:
+        normalized = _normalize_blackwell_arch(env)
+        # Only override the caller env when normalization changed something
+        # (i.e. it lacked the required ``a`` suffix on a Blackwell token).
+        return normalized if normalized != env else None
+    raw = os.environ.get(_NATIVE_CUDA_ARCH_LIST_ENV, _DEFAULT_CUDA_ARCH_LIST)
+    return _normalize_blackwell_arch(raw)
 
 
 def _effective_cuda_arch_list() -> str:
-    return os.environ.get(
-        _PYTORCH_CUDA_ARCH_LIST_ENV,
-        os.environ.get(_NATIVE_CUDA_ARCH_LIST_ENV, _DEFAULT_CUDA_ARCH_LIST),
+    return _normalize_blackwell_arch(
+        os.environ.get(
+            _PYTORCH_CUDA_ARCH_LIST_ENV,
+            os.environ.get(_NATIVE_CUDA_ARCH_LIST_ENV, _DEFAULT_CUDA_ARCH_LIST),
+        )
     )
 
 

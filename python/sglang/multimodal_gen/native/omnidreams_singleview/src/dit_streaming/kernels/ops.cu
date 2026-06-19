@@ -1599,15 +1599,30 @@ namespace {
 
         Gemm gemm_op;
         auto status = gemm_op.can_implement(arguments);
-        if (status != cutlass::Status::kSuccess) return cudaErrorNotSupported;
+        if (status != cutlass::Status::kSuccess) {
+            if (cosmos_fp8_fused_debug_enabled())
+                std::fprintf(stderr, "[bf16gemm] can_implement FAIL status=%d (%s) M=%d N=%d K=%d\n",
+                             int(status), cutlass::cutlassGetStatusString(status), M, N_gemm, K);
+            return cudaErrorNotSupported;
+        }
 
         size_t ws_size = Gemm::get_workspace_size(arguments);
         void* ws = ws_size > 0 ? ensure_sm120_workspace(ws_size) : nullptr;
 
         status = gemm_op.initialize(arguments, ws, stream);
-        if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+        if (status != cutlass::Status::kSuccess) {
+            if (cosmos_fp8_fused_debug_enabled())
+                std::fprintf(stderr, "[bf16gemm] initialize FAIL status=%d (%s) M=%d N=%d K=%d ws=%zu\n",
+                             int(status), cutlass::cutlassGetStatusString(status), M, N_gemm, K, ws_size);
+            return cudaErrorUnknown;
+        }
         status = gemm_op.run(stream);
-        if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+        if (status != cutlass::Status::kSuccess) {
+            if (cosmos_fp8_fused_debug_enabled())
+                std::fprintf(stderr, "[bf16gemm] run FAIL status=%d (%s) M=%d N=%d K=%d\n",
+                             int(status), cutlass::cutlassGetStatusString(status), M, N_gemm, K);
+            return cudaErrorUnknown;
+        }
         return cudaGetLastError();
     }
 
@@ -2033,15 +2048,33 @@ cudaError_t cutlass_linear_layer_rcr_fp8(
 
         Gemm gemm_op;
         auto status = gemm_op.can_implement(arguments);
-        if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+        if (status != cutlass::Status::kSuccess) {
+            std::fprintf(stderr,
+                "[DIAG] rcr_fp8 can_implement FAIL | M=%d N=%d K=%d | status=%s\n",
+                M, N_gemm, K, cutlass::cutlassGetStatusString(status));
+            return cudaErrorUnknown;
+        }
 
         size_t ws_size = Gemm::get_workspace_size(arguments);
         void* ws = ws_size > 0 ? ensure_sm120_workspace(ws_size) : nullptr;
 
         status = gemm_op.initialize(arguments, ws, stream);
-        if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+        if (status != cutlass::Status::kSuccess) {
+            std::fprintf(stderr,
+                "[DIAG] rcr_fp8 init FAIL | M=%d N=%d K=%d ws=%zu | status=%s\n",
+                M, N_gemm, K, ws_size, cutlass::cutlassGetStatusString(status));
+            return cudaErrorUnknown;
+        }
         status = gemm_op.run(stream);
-        if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+        if (status != cutlass::Status::kSuccess) {
+            cudaError_t sync_err = cudaStreamSynchronize(stream);
+            std::fprintf(stderr,
+                "[DIAG] rcr_fp8 run FAIL | M=%d N=%d K=%d | status=%s | cudaSync=%s\n",
+                M, N_gemm, K,
+                cutlass::cutlassGetStatusString(status),
+                cudaGetErrorString(sync_err));
+            return cudaErrorUnknown;
+        }
         return cudaSuccess;
     }
 #endif
@@ -2635,15 +2668,33 @@ cudaError_t cutlass_linear_layer_rcr_fp8_gelu(
 
         Gemm gemm_op;
         auto status = gemm_op.can_implement(arguments);
-        if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+        if (status != cutlass::Status::kSuccess) {
+            std::fprintf(stderr,
+                "[DIAG] rcr_fp8_gelu can_implement FAIL | M=%d N=%d K=%d | status=%s\n",
+                M, N_gemm, K, cutlass::cutlassGetStatusString(status));
+            return cudaErrorUnknown;
+        }
 
         size_t ws_size = Gemm::get_workspace_size(arguments);
         void* ws = ws_size > 0 ? ensure_sm120_workspace(ws_size) : nullptr;
 
         status = gemm_op.initialize(arguments, ws, stream);
-        if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+        if (status != cutlass::Status::kSuccess) {
+            std::fprintf(stderr,
+                "[DIAG] rcr_fp8_gelu init FAIL | M=%d N=%d K=%d ws=%zu | status=%s\n",
+                M, N_gemm, K, ws_size, cutlass::cutlassGetStatusString(status));
+            return cudaErrorUnknown;
+        }
         status = gemm_op.run(stream);
-        if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+        if (status != cutlass::Status::kSuccess) {
+            cudaError_t sync_err = cudaStreamSynchronize(stream);
+            std::fprintf(stderr,
+                "[DIAG] rcr_fp8_gelu run FAIL | M=%d N=%d K=%d | status=%s | cudaSync=%s\n",
+                M, N_gemm, K,
+                cutlass::cutlassGetStatusString(status),
+                cudaGetErrorString(sync_err));
+            return cudaErrorUnknown;
+        }
         return cudaSuccess;
     }
 #endif

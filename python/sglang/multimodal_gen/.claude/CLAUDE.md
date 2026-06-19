@@ -46,6 +46,8 @@ configs/
 ├── pipeline_configs/    # Per-model pipeline configs
 ├── sample/             # SamplingParams
 └── models/             # DiT, VAE, Encoder configs
+native/
+└── omnidreams_singleview/  # Vendored FlashDreams native FP8 extension (C++/CUDA + Python shims)
 ```
 
 ### Key Classes
@@ -129,7 +131,31 @@ sglang generate --model-path /path/to/omni-dreams-checkpoint \
   --hdmap-path hdmap.mp4 \
   --enable-torch-compile --warmup \
   --seed 42 --save-output
+
+# With native FP8 DiT (sm_120 / Blackwell only — Python API)
+from sglang import DiffGenerator
+gen = DiffGenerator.from_pretrained(
+    "/path/to/omni-dreams-checkpoint",
+    pipeline_class_name="OmniDreamsPipeline",
+    pipeline_config_kwargs={"native_dit_acceleration": "auto"},
+    server_kwargs={"text_encoder_cpu_offload": True, "vae_cpu_offload": True},
+)
+result = gen.generate(sampling_params_kwargs={
+    "prompt": "A car driving down a city street",
+    "image_path": "first_frame.png",
+    "seed": 42,
+})
+
+# Force native FP8 (fails if extension unavailable):
+SGLANG_OMNIDREAMS_FP8_DIT=1 sglang serve --model-path /path/to/omni-dreams-checkpoint \
+  --pipeline-class-name OmniDreamsPipeline \
+  --text-encoder-cpu-offload --vae-cpu-offload
 ```
+
+`native_dit_acceleration` is NOT a CLI flag — use `pipeline_config_kwargs` in the Python API,
+`SGLANG_OMNIDREAMS_FP8_DIT=1` env var, or a server config file. The native C++ sources under
+`native/omnidreams_singleview/` are JIT-compiled via `torch.utils.cpp_extension.load()` on
+first use; a prebuilt `.so` is reused across restarts.
 
 ### Architecture
 
@@ -157,12 +183,21 @@ DecodingStage (standard single-pass VAE decode)
 | `runtime/pipelines/omnidreams_pipeline.py` | Pipeline loader: non-Diffusers flat `.pt`, VAE/text/scheduler resolution, stage wiring |
 | `runtime/pipelines_core/stages/model_specific_stages/omnidreams.py` | BeforeDenoisingStage + DenoisingStage (AR rollout loop) |
 | `runtime/models/dits/omnidreams.py` | OmniDreamsDiT (2.06B, 28 blocks), OmniDreamsBlock, OmniDreamsAttention |
+| `runtime/models/dits/omnidreams_fp8.py` | OmniDreamsFP8DiT: native FP8 dispatch wrapper, `_SGLTransformerAdapter` |
 | `runtime/models/dits/omnidreams_kvcache.py` | BlockKVCache: windowed KV cache with sink + split-copy roll |
 | `runtime/models/dits/omnidreams_rope.py` | RotaryPositionEmbedding3D (NeoX 44:42:42), apply_rope_freqs, to_cos_sin_cache |
 | `runtime/models/encoders/omnidreams_text.py` | full_concat_embeddings: 28-layer hidden-state mean-normalize -> 100352-dim |
 | `configs/models/dits/omnidreams.py` | OmniDreamsDiTArchConfig (2048-d, 28 blocks, 16 heads, HDMap 16ch) |
 | `configs/pipeline_configs/omnidreams.py` | OmniDreamsPipelineConfig (I2V, bf16 DiT, fp32 VAE, 2-step warp sigma) |
 | `configs/sample/omnidreams.py` | OmniDreamsSamplingParams (720p, 2-step, len_t=2, window_size_t=6) |
+| `native/omnidreams_singleview/python/optimized_dit.py` | Vendored OptimizedDiTExecutor: weight snapshot, `_ensure_weights_snapshot`, `_predict_flow_ext_impl` |
+| `native/omnidreams_singleview/python/cosmos_weights.py` | Vendored BF16 streaming weight prep (QKV fuse + `_prepared` transpose) |
+| `native/omnidreams_singleview/python/cosmos_fp8_utils.py` | Vendored FP8 quantization: `prepare_cosmos_quantized_streaming_weights` |
+| `native/singleview_loader.py` | JIT build + prebuilt `.so` loader for the native CUDA extension |
+| `native/omnidreams_singleview/src/omnidreams_singleview_ext.cpp` | Unified PYBIND11_MODULE entry (DiT + VAE + VAE-streaming bindings) |
+| `native/omnidreams_singleview/src/dit_streaming/pyext/streaming_dit_bridge.cu` | C++ bridge: `optimized_dit_forward()`, `get_w()`, quantized weight extraction |
+| `native/omnidreams_singleview/src/dit_streaming/kernels/cosmos_block.cuh` | `CosmosBlockWeights/Buffers/Params` structs, all native kernel declarations |
+| `native/omnidreams_singleview/src/dit_streaming/kernels/cosmos_block.cu` | Per-block orchestrator: AdaLN split, ln_modulate, FP8/BF16 dispatch, cuDNN FMHA |
 
 ### Non-Negotiable Architecture Facts
 
@@ -185,6 +220,34 @@ DecodingStage (standard single-pass VAE decode)
 - **Cross-view:** Gated by enable_cross_view_attn=False (single-view checkpoint). Raises NotImplementedError when on.
 - **TP: yes, SP: no.** ColumnParallelLinear/RowParallelLinear for TP projection layers.
   SP (ulysses/ring) rejected with clear error in AR rollout stage.
+- **Native FP8 DiT (P4a):** Vendored from FlashDreams under `native/omnidreams_singleview/`.
+  Requires sm_120 (Blackwell). Activated via `pipeline_config_kwargs={"native_dit_acceleration": "auto"}`
+  or env `SGLANG_OMNIDREAMS_FP8_DIT=1`. All C++/CUDA + `cosmos_weights.py` + `cosmos_fp8_utils.py`
+  are byte-identical to the FlashDreams source. Only `optimized_dit.py` differs (5 FlashDreams
+  import stubs). The DenoisingStage wraps the vendored `OptimizedDiTExecutor` with
+  `_SGLTransformerAdapter` (in `omnidreams_fp8.py`), which presents SGLang's `OmniDreamsDiT`
+  as FlashDreams' `CosmosTransformer`. Weight pipeline: `state_dict()` → QKV fuse →
+  per-out-channel FP8 quant (8 per-block linears → uint8 E4M3 + FP16 scale) → `_fp8_prepared`
+  aliases. norm/adaln/embedder/final_layer stay BF16. C++ bridge resolves quantized weights
+  via `cosmos_quantized_prepared=True` two-level alias resolution. Both eager and native paths
+  receive raw patch tokens `[B, L, 64]` from the DenoisingStage and run the real `x_embedder`
+  projection through the checkpoint weight `[2048, 68]`.
+
+  **Fallback chain (three-layer graceful degradation):**
+  1. `singleview_loader.py`: tries prebuilt `.so` first, then JIT-compiles. Returns `None` if both fail.
+  2. `_load_native()`: if `mode="auto"` and `load_extension()` returned `None`, returns `None`;
+     if `mode="required"`, raises `NativeAccelerationUnavailable`.
+  3. `OmniDreamsDenoisingStage`: if `build_fp8_dit()` returns `None`, falls back to eager
+     `OmniDreamsDiT.forward()`. The eager CUDA-graph runner is **disabled** when native is
+     attempted (mutual exclusion) and **not re-enabled** on fallback. Runtime C++ failures
+     after successful init propagate as Python exceptions and terminate the request.
+
+  **Known tech debt:**
+  - `x_embedder` fixup at `omnidreams_fp8.py:198-204` already removed (was dead code).
+  - `prepare_fp8_dit_weights()` at `omnidreams_fp8.py:65` defined but never called in
+    production — only useful for offline preprocessing or tests.
+  - `_load_prebuilt_extension()` mutates `os.environ["LD_LIBRARY_PATH"]` permanently on
+    first load. Harmless but messy.
 
 ### Performance Optimizations (Active)
 
@@ -194,8 +257,9 @@ DecodingStage (standard single-pass VAE decode)
 | T2 | RoPE kernel | omnidreams_rope.py + DiT | to_cos_sin_cache + _apply_rotary_emb dispatch (FlashInfer/Triton fallback) |
 | T3 | KV-cache split-copy | BlockKVCache | Split-copy eliminates per-block .clone() during window roll |
 | T4 | Text encoder cache | BeforeDenoisingStage | OrderedDict LRU (max 32) keyed on prompt, embeddings stored on CPU |
-| T5 | Cross-attn KV precompute | OmniDreamsDiT | K/V projected once per prompt, reused across all AR chunks (28 blocks x N chunks x 3 calls) |
-| T6 | torch.compile on blocks | OmniDreamsDiT | _compile_conditions = [isinstance(m, OmniDreamsBlock)] (outer AR loop stays eager) |
+| T5 | Cross-attn KV precompute | OmniDreamsDiT | K/V projected once per prompt, reused across all AR chunks |
+| T6 | torch.compile on blocks | OmniDreamsDiT | _compile_conditions = [isinstance(m, OmniDreamsBlock)] |
+| T7 | Native FP8 DiT | native/omnidreams_singleview/ | CUTLASS FP8 tensor-core GEMMs + cuDNN FP8 FMHA + native fused kernels |
 
 ### Tests
 
@@ -207,6 +271,9 @@ python -m pytest python/sglang/multimodal_gen/test/unit/test_omnidreams_scaffold
 # Regression + HD-map (needs GPU + checkpoint)
 python -m pytest python/sglang/multimodal_gen/test/unit/test_omnidreams_regression.py -x -v
 python -m pytest python/sglang/multimodal_gen/test/unit/test_omnidreams_hdmap_validation.py -x -v
+
+# FP8 DiT tests (needs GPU + native extension build)
+python -m pytest python/sglang/multimodal_gen/test/unit/test_omnidreams_fp8.py -x -v
 ```
 
 ### Diagnostics
@@ -225,6 +292,7 @@ SGLANG_DIFFUSION_STAGE_LOGGING=1 sglang generate ...
 - `OmniDreamsOptimizationFindings.md` — Deep-dive on all 12 optimization targets
 - `omnidreams_blur_diagnosis_report.md` — Root cause of the attention_mask blur bug
 - `progress.md` — HD-map validation results + GPU memory observations
+- `docs/superpowers/p4a_optimized_dit_refactor_to_sglang_native.md` — Plan to refactor vendored OptimizedDiTExecutor into SGLang-native implementation
 
 For detailed file paths, architecture facts, and step-by-step build instructions, invoke
 the `sglang-diffusion-omnidreams` skill.
@@ -253,3 +321,4 @@ Defined in `envs.py` (300+ vars). Key ones:
 - `SGLANG_DIFFUSION_ATTENTION_BACKEND` — attention backend override
 - `SGLANG_CACHE_DIT_ENABLED` — enable Cache-DiT acceleration
 - `SGLANG_CLOUD_STORAGE_TYPE` — cloud output storage (s3, etc.)
+- `SGLANG_OMNIDREAMS_FP8_DIT` — force `native_dit_acceleration="required"` (sm_120 only)

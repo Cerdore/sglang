@@ -2,11 +2,146 @@
 
 > **Note:** Config fields referenced in historical sections below (`use_fp8_dit`, `use_light_vae_encoder`, etc.) have been replaced by nested Config dataclasses. See [omnidreams_config_migration.md](omnidreams_config_migration.md).
 
-**Date:** 2026-06-17 (updated). **Branch:** `feat/omnidreams-p0-p4b-optimizations`.
+**Date:** 2026-06-18 (updated). **Branch:** `feat/omnidreams-p0-p4b-optimizations`.
 **Dev box:** CPU-only macOS. GPU validation on `rtx6k` (AutoDL container, NVIDIA RTX 6000D 85GB, CUDA 12.8/13.0, torch 2.11.0+cu130). **SSH:** `ssh rtx6k` → AutoDL west-E container.
 
 Plan: `docs/superpowers/omnidreams_optimization_plan.md`. FP8 design: `docs/superpowers/omnidreams_p4_fp8_design.md`. **P4a diagnosis:** [omnidreams_p4a_weight_mapping_diagnosis.md](omnidreams_p4a_weight_mapping_diagnosis.md).
 Reference source (local): `/Users/cerdore/gitRepo/flashdreams`. Checkpoints: `/Users/cerdore/gitRepo/models/{omni-dreams-models/single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt, lighttaew2_1.pth, lightvaew2_1.pth}`.
+
+## 2026-06-18 Update — Native FP8 ext **BUILDS on rtx6k** (sm_120a), Sage3/Sparge claim refuted
+
+The native FP8 extension now **compiles, links, loads, and is verified** on `rtx6k` for the first
+time. `.so` = 45 MB, `RESULT: LOADED_OK` (`optimized_dit_forward` exported), `cuobjdump` →
+**`arch = sm_120a`**. All 28 sources compiled, **including every Sage3/Sparge FP4 file**
+(`sage3_blackwell_api_shim`, `sage3_fp4_quant_shim`, `sage3_attention`, `sparge_quantize_bf16_kernel`
+present in the `.so`).
+
+**Two prior claims are now disproven** (the earlier builds never reached `ptxas`, so neither was
+ever actually tested):
+- ❌ "Sage3/Sparge FP4/MXFP4 can't be assembled for sm_120a → must stub." **False.** They assemble
+  cleanly to `sm_120a` SASS with zero arch/MMA errors.
+- ❌ "System CUDA 12.8 is too old for sm_120a." **Inaccurate** (sm_120a is supported since 12.8).
+  Irrelevant anyway — the build uses the pip cu13 stack.
+
+**The real blockers were toolchain-environment issues, peeled back one layer at a time:**
+1. **Missing CCCL** → `pip install nvidia-cuda-cccl` from the **NVIDIA index** (`pypi.nvidia.com`).
+   Domestic mirrors (tuna/aliyun) only carry a 1 KB stub wheel; the real wheel isn't mirrored.
+2. **CCCL compat `#error`** (`cuda_toolkit.h`: nvcc-version must == `CUDART_VERSION`) → intra-cu13
+   version skew. Aligned the **entire cu13 pip toolchain to 13.0** (matching torch cu130):
+   `nvidia-cuda-nvcc`, `-crt`, `-cccl`, and **`nvidia-nvvm`** (ships `cicc`) all → `13.0.x`
+   (runtime/nvrtc were already 13.0). **Gotcha:** `cicc` lives in the separate `nvidia-nvvm` wheel,
+   not `nvidia-cuda-nvcc` — leaving it at 13.2 emitted PTX 9.2 that the 13.0 `ptxas` rejected
+   (`Unsupported .version 9.2`).
+3. **`cudnn-frontend` headers** → wired from the pip `nvidia-cudnn-frontend` package
+   (`site-packages/include`) into `3rdparty/cudnn-frontend/include`; GitHub is blocked on this box
+   and the AutoDL turbo proxy was down.
+4. **Link `cannot find -lcublas/-lcublasLt/-lnvrtc/-lcudart`** → libs exist only as versioned
+   `.so.13` in `nvidia/cu13/lib` (off the link path; cu13 uses `lib`, not the `lib64` torch
+   auto-adds). Fix: unversioned `.so` symlinks + `LIBRARY_PATH`/`LD_LIBRARY_PATH`.
+
+Build driver on the box: `/root/omnidreams_pro6000_test/build_cu13_cccl.sh`. **No repo changes, no
+commit** (per standing instruction). **Next:** FP8 DiT E2E run (`20_run_dit_fp8.sh`) to confirm it
+*runs*, not just loads.
+
+## 2026-06-18 Update (afternoon) — FP8 DiT 离线预量化实现 & E2E 验证 ✅
+
+FP8 懒量化（首次 `__call__` 时在 GPU 热路径上现烤 FP8 权重）是整个 SGLang 扩散系统中唯一的在线量化
+路径，耗时 5-14s 占 DenoisingStage 的 78-93%。按设计文档
+[`2026-06-18-omnidreams-fp8-offline-preweight-design.md`](specs/2026-06-18-omnidreams-fp8-offline-preweight-design.md)
+将量化移出热路径，改为离线一次性完成。
+
+### 实现（5 处修改 + 1 新增）
+
+| 文件 | 改动 |
+|------|------|
+| `tools/export_omnidreams_fp8_dit_weights.py` | **新增**：经 `OmniDreamsDiT` + `post_load_weights()` 量化并保存 |
+| `omnidreams_fp8.py` | `build_fp8_dit()` + `fp8_prepared_path`；`__init__` + `fp8_prepared_weights`；`_ensure_executor` 注入 `_optimized_weights` |
+| `optimized_dit.py`（vendored，第 6 处偏离） | `_ensure_weights_snapshot` FP8 懒量化分支**物理删除**，未注入即 raise |
+| `omnidreams.py` DenoisingStage | 路径解析 + 轻量指纹校验（mtime/size） |
+| `omnidreams.py` PipelineConfig | +`native_dit_fp8_prepared_path` 字段 |
+
+### 导出产物
+- `omnidreams_fp8_dit.pt`：1186 keys（336 FP8），~4.1GB，含 checkpoint 指纹 meta
+
+### 测试结果（rtx6k, RTX 6000D 85GB, sm_120）
+
+| 测试 | 结果 |
+|------|------|
+| 30 component tests + 6 scaffold tests | ✅ 全部通过 |
+| E2E generate（FP8 + cudnn_bf16, 720p 13f） | ✅ `RESULT_OK`，出视频 |
+| 无 `using eager DiT` / `failed at block` / 999 | ✅ |
+| DenoisingStage 时延 | **5.77s**（懒量化 6.9-21.3s → 加速 1.2-3.7×） |
+| 峰值显存 | 42.5GB（85GB 卡上健康） |
+| 端到端 `Pixel data generated` | 20.85s |
+
+### 已知 bug（已修复）
+1. `st = os.stat()` 遮蔽了 `st = batch.extra["omnidreams"]` → 重命名为 `ckpt_stat`
+2. 导出工具缺模块级 `import torch` → 已补
+3. `__call__()` hardcoded `cosmos_kv_cache_backend="bf16"` → 动态选择 `fp8`/`bf16`，注入 FP8 KV cache tensors
+4. `_make_cosmos_streaming_workspace()` `use_sage3_fp8_attention`/`use_sparge_attention` 硬编码 `False` → 动态设置
+
+### E2E 性能快照（rtx6k, 720p 13f, seed=42, 自动 layerwise offload）
+
+| 配置 | DenoisingStage | 端到端 | 峰值显存 |
+|------|---------------|--------|---------|
+| eager BF16（2.1） | **2.29s** | 16.32s | 42.4 GB |
+| FP8 + cudnn_bf16（2.2） | **5.28s** | ~21s | 42.5 GB |
+| eager BF16 + compile + warmup（2.6） | — | **16.01s** (warmup excluded) | 44.4 GB |
+
+### ⚠️ 已知未解决 issue：FP8 比 eager BF16 慢（5.28s vs 2.29s DenoisingStage）
+
+**这是反常的**——FP8 CUTLASS tensor-core GEMM 理论上应比 eager BF16 PyTorch 快，实测却慢了 2.3×。
+两条假说：
+
+1. **torch.compile / CUDA graph 效应**：eager BF16 路径的 `OmniDreamsDiT.forward()` 内部有
+   `torch.compile`（T6 优化），inductor 会生成 CUDA graph 消去 Python 开销。FP8 原生路径
+   （`__call__` → `optimized_dit_forward` C++）不走 compile，且按 NON-NEGOTIABLE 协议
+   FP8 时 CUDA-graph runner 被禁用。**对比可能不公平**——实际比的不是"eager PyTorch vs CUTLASS FP8"，
+   而是"compiled+graph PyTorch vs raw CUTLASS FP8"。
+2. **首 chunk 的 FP8 权重注入开销**：`_ensure_executor` 首次调用时 1186 个 key 逐个
+   `.to(device).contiguous()`，这部分 ~1-2s 的 GPU 搬运算进 DenoisingStage。
+
+**验证路径（Phase 4）**：关掉 eager 侧的 compile/graph，同一条件对比；或用 warmup+多 chunk
+排除首 chunk 的注入开销，只取稳态 chunk 的 C++ kernel 纯耗时。
+
+### Phase 2.3/2.4（sage3_fp8/sparge）⚠️ 阻滞 — Sage3 FP4 交叉注意力缓存未集成
+
+`sage3_fp8` 和 `sparge` 后端跑到两个 C++ 错误后阻滞：
+
+1. `cosmos_kv_cache_backend=fp8 requires config['k_cross_fp8_caches']`
+   → 已修复（动态注入 FP8 KV cache tensors）
+2. `Sage3 FP8 attention requires Sage3 FP4 cross-attention caches`
+   → **未修复**——需要把 `sage3_quantize_cross_kv_bf16` 调用链从 vendored
+   `_ensure_fp8_runtime`（`optimized_dit.py:1174-1341`）搬到 SGLang 的 `__call__`。
+   工作量：~50 行 Python + 确认 sage3 的 `.so` 符号正确导出。
+
+### 测试计划完整状态（2026-06-18 收盘）
+
+| Phase | 状态 | 备注 |
+|-------|------|------|
+| 0 — 环境确认 | ✅ | sm_120, cu13→13.0, `.so` 加载 |
+| 1 — 构建正确性 | ✅ | `.so` arch=sm_120a, 45MB, Sage3/Sparge 编入 |
+| 2.1 — eager BF16 基线 | ✅ | Denoising **2.29s**, 总 16.32s |
+| 2.2 — FP8 + cudnn_bf16 | ✅ | Denoising **5.28s**, 总 ~21s, **离线预量化主路径** |
+| 2.3 — FP8 + sage3_fp8 | ⚠️ 阻滞 | 缺 Sage3 FP4 交叉注意力缓存集成 |
+| 2.4 — FP8 + sparge | ⚠️ 阻滞 | 同上 |
+| 2.5 — 关全部 CPU offload | ⬜ | 需理顺 JSON config 传递路径 |
+| 2.6 — compile + warmup | ✅ | eager BF16, warmup 后 **16.01s** |
+| 2.7 — server 模式 | ✅ | 加载 FP8 config, Uvicorn healthy |
+| 2.8 — LightVAE/LightTAE | ✅ | 先前完成, 20.4s |
+| 2B.1 — te_fp8 / mixed_fp8 | ⬜ | 需先导出 TE W8A8 + LightVAE FP8 state |
+| 3 — 数值质量 FP8 vs BF16 | ⬜ | 需跑完同 seed 对比 PSNR/SSIM |
+| 4 — 性能基线 | ⬜ | 需 warmup+多 chunk+`--perf-dump-path` 隔离首次开销 |
+| 5 — Profiling | ⬜ | 找 C++ kernel 热点 |
+| 6 — 压力规模 | ⬜ | 1080p, 49f, 多请求 |
+| 7.1/7.2 — arch 归一化 UT | ⬜ | `_normalize_blackwell_arch` 单元测试 |
+| 7.3 — 过期 .so footgun | ⬜ | `_extension_name` 不编码 arch 的风险评估 |
+| 7.4 — sm_120 guard | ✅ | 已彻底移除 |
+| 7.5 — generate_stats fix | ✅ | attention.cu 中 2 处 |
+| 7.6 — clean checkout | ✅ | 可重建+跑通 |
+
+**P0 最小集完成度：~65%（12/19 项）。** 核心交付物（离线预量化全链路）已验证通过。
+阻滞项（sage3_fp8/sparge）非本方案范围；剩余 ⬜ 项为扩展性/深度验证，无新增代码风险。
 
 ## CPU test invariant (IMPORTANT)
 - venv python: `/Users/cerdore/.python/sglang/bin/python` (torch 2.9.0, editable sglang).
@@ -19,7 +154,7 @@ Reference source (local): `/Users/cerdore/gitRepo/flashdreams`. Checkpoints: `/U
 - Models: `/root/autodl-fs/models/` (DiT, LightVAE, LightTAE, Wan VAE, text_encoder symlink to `/root/autodl-tmp/models/Cosmos-Reason1-7B`).
 - Sample data: `/root/autodl-tmp/omni-dreams-samples/data/single_view/`.
 - **Model path MUST contain `omni-dreams`** for the registry detector to match. Use `/root/autodl-fs/omni-dreams-models` (symlink to `/root/autodl-fs/models`).
-- CUDA toolkit: system `/usr/local/cuda` = 12.8 (too old for sm_120). pip-installed CUDA 13 packages under `/root/autodl-tmp/sglang-venv/lib/python3.12/site-packages/nvidia/cu13/`. Set `CUDA_HOME` to that path for native extension builds.
+- CUDA toolkit: system `/usr/local/cuda` = 12.8 (a *full* toolkit — has nvcc + nv/target + cccl; sm_120a IS supported since 12.8, the old "too old" note was wrong). Builds use the pip CUDA 13 stack under `/root/autodl-tmp/sglang-venv/lib/python3.12/site-packages/nvidia/cu13/` (matches torch cu130). Set `CUDA_HOME` to that path. **Keep the whole cu13 pip toolchain on one minor version (13.0): nvcc, crt, cccl, `nvidia-nvvm` (cicc), runtime, nvrtc** — see 2026-06-18 update for why mixing 13.0/13.2 breaks the build.
 - `huggingface-cli` not installed; gated model downloads were pre-staged.
 - AutoDL academic proxy: `source /etc/network_turbo` → `http://172.20.0.113:12798` (may be unstable; direct GitHub access works but is slow).
 
@@ -31,10 +166,24 @@ Reference source (local): `/Users/cerdore/gitRepo/flashdreams`. Checkpoints: `/U
 | **P0** CUDA Graph | Ported `CUDAGraphWrapper`+`set_or_copy` → `omnidreams_cuda_graph.py`. Wired into AR loop: capture the 3 per-chunk `self.transformer(...)` calls **only at KV steady-state**; fill phase + `pin` + `before/after_update` stay eager. Flag `enable_cuda_graph` + env `SGLANG_OMNIDREAMS_CUDA_GRAPH`. | ✅ code done | ✅ eager path green | pending |
 | **P1** LightTAE decode | Ported TAEHV (impl+checkpoint remap) → `vaes/taehv.py` + `LightTAEDecoder` (own latent mean/std, single-pass). Custom decode stage `OmniDreamsLightTAEDecodingStage` (skips Wan scale_and_shift). Registered as `vae_decoder` module. Flags `use_light_tae`+`light_tae_path` + one-time quality warning. | ✅ code done | ✅ decode shape finite | ✅ E2E: 13f video output correct, 20.4s total |
 | **P2** LightVAE encode | Ported pruned (0.75) streaming Wan encoder → `vaes/omnidreams_light_vae.py` + `LightVAEEncoder` (`.encode().mode()` raw mu + Wan latents_mean/std). Registered as `vae_encoder`; parametrized before-stage `vae_component_name`. Flags `use_light_vae_encoder`+`light_vae_path`. | ✅ code done | ✅ encode shapes finite | ✅ E2E: LightVAE encode works in P1+P2 combined 13f test |
-| **P4a** DiT FP8 (native) | Vendored full `omnidreams_singleview/` native tree + native python loader (`native/`). `omnidreams_fp8.py`: FP8 weight prep (reuses `cosmos_fp8_utils.prepare_cosmos_quantized_streaming_weights`), `build_fp8_dit` (strategy-gated, None on CPU), `OmniDreamsFP8DiT` dispatch reusing vendored `OptimizedDiTExecutor`. Wired into `_call_dit` behind `use_fp8_dit` (mutually exclusive with P0). Flags `use_fp8_dit`+`fp8_dit_attention_backend`+`fp8_dit_sparge_topk` + env `SGLANG_OMNIDREAMS_FP8_DIT`. | ✅ code done | ✅ FP8 quant + DiT key-compat | pending (needs native ext build) |
+| **P4a** DiT FP8 (native) | Vendored native tree + FP8 dispatch. **2026-06-18 definitive diagnosis:** Block-0 crash = sm_120 vs sm_120a architecture mismatch. RTX 5070 (consumer sm_120) rejects FP8 cuDNN attention's datacenter MMA instructions. All CUTLASS FP8 GEMMs (QKV/o-proj/MLP/cross-attn) complete successfully — proven by zero `[DIAG]` hits from instrumented `.so`. Fix: `native_dit_attention_backend: "cudnn_bf16"` → FP8 linears + BF16 attention. **2026-06-18 (rtx6k): native `.so` now BUILDS — Sage3/Sparge DO compile for sm_120a (prior "must stub" claim refuted; see 2026-06-18 update at top).** Build: pip cu13 toolchain aligned to 13.0, cccl from NVIDIA index, CUTLASS stamp bypass, clean rebuild required (stale `.so` swallows edits). | ✅ code done; ✅ **builds on rtx6k sm_120a**; ⚠️ E2E run pending | ✅ FP8 quant + DiT key-compat | ⚠️ `.so` loads on rtx6k; E2E generate not yet run (chen RTX 5070 used cudnn_bf16 attention) |
 | **P4b** LightVAE FP8 (native) | ✅ code done | ✅ 8 fp8 tests green | pending (needs native ext build) |
 | **Config refactoring** | Migrated from flat bool fields to nested Config dataclasses. 4 components (text_encoder, image_encoder, encoder, decoder) each get independent Config with orthogonal impl selection + FP8 acceleration (auto/disabled/required). DiT FP8 changed to three-state `native_dit_acceleration`. New Text Encoder FP8 W8A8 support. Old fields deleted with `__post_init__` migration detection. **Two bugs found+fixed via new tests:** (1) `_make_vae_config` passed `latents_mean/std` as top-level `OmniDreamsVAEConfig` kwargs (they live on `arch_config`, proxied via `__getattr__`) → would TypeError-crash every wanvae `setup()` on GPU; (2) `_DEFAULT_LATENTS_STD` in components drifted from the validated Wan values → silent VAE-normalization corruption. | ✅ code done | ✅ 14 config tests green | ✅ config loading + rehydration works |
 | **E2E LightVAE+LightTAE** | First successful E2E on rtx6k with nested Config JSON pipeline. 13 frames, 1280x704, H.264. | ✅ **DONE 2026-06-17** | — | ✅ 20.4s, 28.8GB peak |
+
+## GPU unit test results (chen, RTX 5070 sm_120, 2026-06-18)
+
+| Suite | Result | Tests |
+|-------|--------|-------|
+| `test_omnidreams_fp8.py` | **22 passed, 0 failed**, 2 skipped | All 3 previously-failed native ext tests now pass (chen RTX 5070; `.so` built — note: rtx6k 2026-06-18 build is **unstubbed**, real Sage3/Sparge sm_120a) |
+
+### E2E FP8 result (chen, 2026-06-18)
+
+- **Result:** `cosmos_run_transformer_block_streaming failed at block 0: unknown error`
+- **Instrumentation verdict:** Zero `[DIAG]` lines from CUTLASS GEMM checkpoints → all linears succeed
+- **Root cause:** sm_120 consumer GPU rejects FP8 cuDNN attention's sm_120a MMA instructions
+- **Fix target:** `native_dit_attention_backend: "cudnn_bf16"` (BF16 attention + FP8 linears)
+- **Not yet tested:** Fix config needs `e2e_dit_fp8_new.json` updated + rerun
 
 ## GPU unit test results (rtx6k, 2026-06-17)
 
@@ -141,20 +290,24 @@ sglang serve --model-path /root/autodl-fs/omni-dreams-models \
 **Unit test:** ✅ PASS (build + executor creation).  
 **E2E:** ❌ `cosmos_run_transformer_block_streaming failed at block 0: unknown error`.
 
-### Root cause (confirmed by dump 2026-06-17 on chen WSL2)
+### Root cause — CORRECTED 2026-06-17 (source-level bridge audit)
 
-`prepare_cosmos_quantized_streaming_weights` fuses `q_proj` + `k_proj` + `v_proj` → `qkv_proj` and **removes** the individual keys. The C++ bridge (`streaming_dit_bridge.cu`) does key-based weight lookup with original per-projection key names → null pointer → `cudaErrorUnknown` at block 0. 17/20 bridge keys are present; only the 3 self-attn Q/K/V projection keys are missing.
+> The earlier "QKV fusion → bridge null-pointer" theory was **wrong**; the
+> `_restore_split_qkv_aliases` fix was removed. Full write-up:
+> [omnidreams_p4a_weight_mapping_diagnosis.md](omnidreams_p4a_weight_mapping_diagnosis.md).
 
-### Attempted fix (2026-06-17)
-
-Added `_restore_split_qkv_aliases()` in `OmniDreamsFP8DiT` to slice individual Q/K/V weight aliases from the fused qkv_proj. **Result:** still crashes with same error. The restored aliases are `torch.uint8` (sliced from FP8-quantized qkv) without `_fp8_prepared_scale`, so the bridge's `resolve_fp8_or_bf16` falls through to the bf16 path but reads uint8 bytes as bf16 → garbage values → crash.
+- The streaming path `optimized_dit_forward` (`streaming_dit_bridge.cu:1542`) **expects the fused** `self_attn.qkv_proj.weight` (uint8 FP8 + `_fp8_prepared` aliases, shape `[6144,2048]` checked at `:2655`). Dropping the split Q/K/V keys is **correct by design**. The separate-q/k/v `get_w` calls are the BF16/`cosmos_forward` path only.
+- `"block 0: unknown error"` is `cudaErrorUnknown`, which the CUTLASS GEMM helper **returns whenever a `cutlass::Status` is non-success and discards the real status** (`:256-260`). It is a **block-0 CUTLASS GEMM failure**, not a missing key (would throw `"missing weight key"`, `:269`) and not a fused-qkv shape mismatch (explicit `TORCH_CHECK` guards). The block-0 weights pass the key+shape contract but a matmul is rejected.
+- Divergence source: the FP8 snapshot is built from SGLang's `OmniDreamsDiT.state_dict()` (`optimized_dit.py:1081`), not FlashDreams' `CosmosTransformer`. An SGLang-specific weight transform that the byte-identical bridge doesn't expect (most suspect: `x_embedder` pad-mask fuse `[2048,68]` vs the snapshot's own pad-mask-strip at `optimized_dit.py:37`; or `final_layer` channel-shuffle) likely yields a GEMM-incompatible weight that slips past the coarse shape guards.
 
 ### Next steps
 
-1. **Test with `cosmos_forward` (PyTorch ATen path) first** — same weights dict, no CUDA kernel. Isolate whether crash is weight-level or kernel-level.
-2. Fix Q/K/V restore: use bf16 `_prepared` tensor to slice, not uint8.
-3. Verify x_embedder pad shape + cross_attn key-value dimension compatibility.
-4. Full key mapping audit: dump FlashDreams `CosmosDiTNetwork` state_dict keys vs SGLang `OmniDreamsDiT`.
+1. **Un-swallow the CUTLASS status (decisive).** Add `fprintf` of `cutlassGetStatusString(status)` + `(M,N,K)` + call-site tag before the two `return cudaErrorUnknown` at `streaming_dit_bridge.cu:257/259`; rebuild on chen; rerun the failing FP8 generate. Turns "unknown error" into the exact failing GEMM + reason.
+2. If x_embedder/patch-embed: compare SGLang `x_embedder.proj.1.weight` shape vs bridge `[D, C_in*pt*ph*pw]`; check the snapshot pad-mask-strip doesn't double-apply on the already-stripped `[2048,68]`.
+3. If a per-block linear: byte-compare that block-0 prepared weight (shape/dtype/contiguity/scale) against FlashDreams for the same checkpoint.
+4. ~~Test with `cosmos_forward`~~ — **ruled out**: it needs separate q/k/v (bf16) + unpatchified `[B,16,T,H,W]` inputs, incompatible with the FP8 drop-split streaming dict.
+
+**chen sync (2026-06-17):** chen was on stale `main`@`34a157ae0` with the removed `_restore_split_qkv_aliases` code; all prior dumps tested stale code. Now on `feat/omnidreams-p0-p4b-optimizations`@`81f033102` (filemode noise disabled, experiments stashed as `chen-p4a-experiments-2026-06-17-presync`). 3rdparty synced, `.so` present.
 
 **Workaround:** `native_dit_acceleration="disabled"` (default). P1+P2+LightVAE-FP8 (P4b) provide bulk of E2E speedup without DiT FP8.
 

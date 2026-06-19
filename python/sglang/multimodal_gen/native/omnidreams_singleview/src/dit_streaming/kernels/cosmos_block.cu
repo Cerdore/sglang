@@ -37,6 +37,25 @@ namespace omnidreams_singleview {
 
 namespace {
 
+// [DIAGNOSTIC — revert after P4a debug] env-gated per-sublayer failure trace.
+static inline bool cosmos_block_debug_enabled() {
+  const char* v = std::getenv("OMNIDREAMS_DIT_BLOCK_DEBUG");
+  return v && v[0] && v[0] != '0' && v[0] != 'f' && v[0] != 'F'
+         && v[0] != 'n' && v[0] != 'N';
+}
+#define COSMOS_DBG_FAIL() do { \
+  if (::omnidreams_singleview::cosmos_block_debug_enabled()) \
+    std::fprintf(stderr, "[cosmos_block] FAIL %s:%d err=%d (%s)\n", \
+                 __FILE__, __LINE__, int(err), cudaGetErrorString(err)); \
+} while (0)
+#define COSMOS_DBG_SYNC(tag) do { \
+  if (::omnidreams_singleview::cosmos_block_debug_enabled()) { \
+    cudaError_t _se = cudaDeviceSynchronize(); \
+    std::fprintf(stderr, "[cosmos_block] SYNC line=%d tag=%s err=%d (%s)\n", \
+                 __LINE__, tag, int(_se), cudaGetErrorString(_se)); \
+  } \
+} while (0)
+
 static constexpr float kCosmosFp8LinearPrescaleAlpha = 1.0f / 128.0f;
 static constexpr float kCosmosFp8LinearScaleMul = 1.0f / kCosmosFp8LinearPrescaleAlpha;
 
@@ -481,7 +500,7 @@ static cudaError_t cosmos_record_bf16_absmax(
   if (!dst) return cudaSuccess;
   if (!src || n <= 0) return cudaErrorInvalidValue;
   cudaError_t err = cudaMemsetAsync(dst, 0, sizeof(float), stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   constexpr int threads = 256;
   int64_t blocks = (n + threads - 1) / threads;
   blocks = blocks > 1024 ? 1024 : blocks;
@@ -681,6 +700,9 @@ static cudaError_t cosmos_linear_prequantized_fp8(
       return cudaSuccess;
     }
     if (fused != cudaErrorNotSupported) {
+      std::fprintf(stderr,
+          "[DIAG] cosmos_linear_prequantized_fp8 fused FAIL | N=%d in=%d out=%d gelu=%d | err=%d(%s)\n",
+          N, in_features, out_features, int(gelu), int(fused), cudaGetErrorString(fused));
       return fused;
     }
   }
@@ -692,7 +714,12 @@ static cudaError_t cosmos_linear_prequantized_fp8(
       p.buf.linear_half_scratch,
       N, in_features, out_features, stream,
       kCosmosFp8LinearPrescaleAlpha);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) {
+    std::fprintf(stderr,
+        "[DIAG] cosmos_linear_prequantized_fp8 rcr_fp8 FAIL | N=%d in=%d out=%d gelu=%d | err=%d(%s)\n",
+        N, in_features, out_features, int(gelu), int(err), cudaGetErrorString(err));
+    COSMOS_DBG_FAIL(); return err;
+  }
 
   return cosmos_col_scale_bias_to_bf16(
       p.buf.linear_half_scratch, weight_scale, nullptr, output,
@@ -733,7 +760,7 @@ static cudaError_t cosmos_linear_bf16_or_fp8(
 
   cudaError_t err = cosmos_bf16_to_fp8(
       input, p.buf.linear_fp8_scratch, int64_t(N) * in_features, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
   return cosmos_linear_prequantized_fp8(
       p, p.buf.linear_fp8_scratch, weight, weight_scale, output,
@@ -813,7 +840,7 @@ static cudaError_t cosmos_linear_prequantized_fp8_output(
       p.buf.linear_half_scratch,
       N, in_features, out_features, stream,
       kCosmosFp8LinearPrescaleAlpha);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
   return gelu
       ? apply_col_scale_bias_gelu_to_fp8(
@@ -869,7 +896,7 @@ static cudaError_t cosmos_linear_prequantized_fp8_residual(
       p.buf.linear_half_scratch,
       N, in_features, out_features, stream,
       kCosmosFp8LinearPrescaleAlpha);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
   return cosmos_col_scale_residual_gate_bf16(
       p.buf.linear_half_scratch, weight_scale, residual_inout, gate,
@@ -940,7 +967,7 @@ static cudaError_t cosmos_linear_prequantized_fp8_residual_layernorm_modulate_to
   cudaError_t err = cosmos_linear_prequantized_fp8_residual(
       p, input_fp8, weight, weight_scale, residual_inout, gate,
       N, in_features, out_features, stream, input_scale);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   return cosmos_layernorm_modulate_to_fp8_only<cutlass::bfloat16_t>(
       residual_inout, ln_shift, ln_scale, fp8_out,
       N, out_features, B, eps, stream);
@@ -973,7 +1000,7 @@ static cudaError_t cosmos_linear_bf16_or_fp8_residual_prepared(
   cudaError_t err = cosmos_linear_bf16_or_fp8(
       p, input, weight, weight_scale, tmp,
       N, in_features, out_features, /*gelu=*/false, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   return cosmos_residual_gate<cutlass::bfloat16_t>(
       residual_inout, residual_inout, tmp, gate, N, out_features, p.B, stream);
 }
@@ -995,7 +1022,7 @@ static cudaError_t cosmos_linear_bf16_input_fp8_residual(
   }
   cudaError_t err = cosmos_bf16_to_fp8(
       input, p.buf.linear_fp8_scratch, int64_t(N) * in_features, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   return cosmos_linear_prequantized_fp8_residual(
       p, p.buf.linear_fp8_scratch, weight, weight_scale, residual_inout, gate,
       N, in_features, out_features, stream);
@@ -1022,7 +1049,7 @@ static cudaError_t cosmos_linear_half_input_fp8_residual(
 
   cudaError_t err = cosmos_half_to_fp8(
       input, p.buf.linear_fp8_scratch, int64_t(N) * in_features, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
   return cosmos_linear_prequantized_fp8_residual(
       p, p.buf.linear_fp8_scratch, weight, weight_scale, residual_inout, gate,
@@ -1062,7 +1089,7 @@ static cudaError_t cosmos_attention_fp8_cudnn(
   if (!q_attn) {
     if (!q) return cudaErrorInvalidValue;
     err = cosmos_bf16_to_fp8(q, p.buf.attn_q_fp8, q_elems, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     q_attn = p.buf.attn_q_fp8;
   }
   const cutlass::float_e4m3_t* k_attn = k_fp8;
@@ -1070,9 +1097,9 @@ static cudaError_t cosmos_attention_fp8_cudnn(
   if (!k_attn || !v_attn) {
     if (!k || !v) return cudaErrorInvalidValue;
     err = cosmos_bf16_to_fp8(k, p.buf.attn_k_fp8, kv_elems, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     err = cosmos_bf16_to_fp8(v, p.buf.attn_v_fp8, kv_elems, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     k_attn = p.buf.attn_k_fp8;
     v_attn = p.buf.attn_v_fp8;
   }
@@ -1088,7 +1115,7 @@ static cudaError_t cosmos_attention_fp8_cudnn(
   }
   if (!p.buf.attn_tc_scale_is_ones) {
     err = cosmos_fill_float(p.buf.attn_tc_scale + kScaleSlot, 1, 1.0f, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   }
 
   cutlass::float_e4m3_t* fp8_out = out_fp8;
@@ -1113,15 +1140,15 @@ static cudaError_t cosmos_attention_fp8_cudnn(
     v_cudnn = v_bhmd_packed ? v_fp8_bhmd : p.buf.attn_v_bhmd_fp8;
     if (!q_bhmd_packed) {
       err = cosmos_fp8_bmhd_to_bhmd(q_attn, p.buf.attn_q_bhmd_fp8, p.B, p.M, p.H, p.D, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
     if (!k_bhmd_packed) {
       err = cosmos_fp8_bmhd_to_bhmd(k_attn, p.buf.attn_k_bhmd_fp8, p.B, Mk, p.H, p.D, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
     if (!v_bhmd_packed && v_attn != p.buf.attn_v_bhmd_fp8) {
       err = cosmos_fp8_bmhd_to_bhmd(v_attn, p.buf.attn_v_bhmd_fp8, p.B, Mk, p.H, p.D, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
   }
   (void)v_fp8_bhdm;
@@ -1136,7 +1163,7 @@ static cudaError_t cosmos_attention_fp8_cudnn(
       p.buf.attn_tc_scale + kAmaxSSlot,
       p.buf.attn_tc_scale + kAmaxOSlot,
       p.B, p.M, Mk, p.H, p.D, /*causal=*/false, 0.0f, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
   if (write_fp8_output) {
     if (!write_bf16_output) {
@@ -1273,16 +1300,16 @@ static cudaError_t cosmos_attention_bf16_or_fp8(
   const cutlass::float_e4m3_t* q_attn = q_fp8;
   if (!q_attn) {
     err = cosmos_bf16_to_fp8(q, p.buf.attn_q_fp8, q_elems, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     q_attn = p.buf.attn_q_fp8;
   }
   const cutlass::float_e4m3_t* k_attn = k_fp8;
   const cutlass::float_e4m3_t* v_attn = v_fp8;
   if (!k_attn || !v_attn) {
     err = cosmos_bf16_to_fp8(k, p.buf.attn_k_fp8, kv_elems, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     err = cosmos_bf16_to_fp8(v, p.buf.attn_v_fp8, kv_elems, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     k_attn = p.buf.attn_k_fp8;
     v_attn = p.buf.attn_v_fp8;
   }
@@ -1319,7 +1346,7 @@ static cudaError_t cosmos_attention_bf16_or_fp8(
     }
     if (!p.buf.attn_tc_scale_is_ones) {
       err = cosmos_fill_float(p.buf.attn_tc_scale + kScaleSlot, 1, 1.0f, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
     cutlass::float_e4m3_t* fp8_out = out_fp8;
     if (!fp8_out) {
@@ -1343,15 +1370,15 @@ static cudaError_t cosmos_attention_bf16_or_fp8(
       v_cudnn = v_bhmd_packed ? v_fp8_bhmd : p.buf.attn_v_bhmd_fp8;
       if (!q_bhmd_packed) {
         err = cosmos_fp8_bmhd_to_bhmd(q_attn, p.buf.attn_q_bhmd_fp8, p.B, p.M, p.H, p.D, stream);
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
       }
       if (!k_bhmd_packed) {
         err = cosmos_fp8_bmhd_to_bhmd(k_attn, p.buf.attn_k_bhmd_fp8, p.B, Mk, p.H, p.D, stream);
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
       }
       if (!v_bhmd_packed && v_attn != p.buf.attn_v_bhmd_fp8) {
         err = cosmos_fp8_bmhd_to_bhmd(v_attn, p.buf.attn_v_bhmd_fp8, p.B, Mk, p.H, p.D, stream);
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
       }
     }
     (void)v_fp8_bhdm;
@@ -1366,7 +1393,7 @@ static cudaError_t cosmos_attention_bf16_or_fp8(
         p.buf.attn_tc_scale + kAmaxSSlot,
         p.buf.attn_tc_scale + kAmaxOSlot,
         p.B, p.M, Mk, p.H, p.D, /*causal=*/false, 0.0f, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     if (!out_fp8) {
       err = cosmos_fp8_to_half_bf16(
           fp8_out,
@@ -1374,14 +1401,14 @@ static cudaError_t cosmos_attention_bf16_or_fp8(
           write_bf16_output ? out : nullptr,
           q_elems,
           stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
   if (write_fp8_output && !use_fp8_cudnn) {
     err = cosmos_half_to_fp8(p.buf.attn_o_half, out_fp8, q_elems, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   }
 
   if (use_fp8_cudnn && write_fp8_output) {
@@ -2325,17 +2352,18 @@ cudaError_t cosmos_run_transformer_block_streaming(
     err = cosmos_adaln_lora_split<bf16>(
         p.t_emb, p.w.adaln_sa_down, p.w.adaln_sa_up, p.adaln_lora_3D,
         p.buf.lora_hidden_sa, p.buf.mods_sa, B, K, p.lora_dim, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     err = cosmos_adaln_lora_split<bf16>(
         p.t_emb, p.w.adaln_ca_down, p.w.adaln_ca_up, p.adaln_lora_3D,
         p.buf.lora_hidden_ca, p.buf.mods_ca, B, K, p.lora_dim, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     err = cosmos_adaln_lora_split<bf16>(
         p.t_emb, p.w.adaln_mlp_down, p.w.adaln_mlp_up, p.adaln_lora_3D,
         p.buf.lora_hidden_mlp, p.buf.mods_mlp, B, K, p.lora_dim, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   }
   rec(EV_AFTER_LORA);
+  COSMOS_DBG_SYNC("after_lora");
 
   // (shift, scale, gate) views into the [B, 3K] mods buffer.
   const bf16* mods_sa = has_all_precomputed_mods ? p.precomputed_mods_sa : p.buf.mods_sa;
@@ -2407,8 +2435,9 @@ cudaError_t cosmos_run_transformer_block_streaming(
     err = cosmos_layernorm_modulate<bf16>(
         p.x, shift_sa, scale_sa, normed, M * B, K, B, 1e-6f, stream);
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_SA_LN);
+  COSMOS_DBG_SYNC("after_sa_ln");
 
   // 1b) Q/K/V projections (three separate [K, K] GEMMs).
   //
@@ -2425,16 +2454,16 @@ cudaError_t cosmos_run_transformer_block_streaming(
     err = cosmos_linear_prequantized_fp8(
         p, p.buf.linear_fp8_scratch, p.w.sa_w_qkv, p.w.sa_w_qkv_scale, p.buf.qkv_row,
         M * B, K, 3 * K, /*gelu=*/false, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     if (!quantized_attention) {
       err = cosmos_split_qkv_row(p.buf.qkv_row, q_row, k_row, v_row, M * B, K, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
   } else if (use_fused_bf16_qkv) {
     err = cutlass_linear_layer_rrr_bf16_prepared(
         normed, p.w.sa_w_qkv_prepared, /*bias=*/nullptr, p.buf.qkv_row,
         M * B, K, 3 * K, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   } else if (sa_normed_needs_fp8) {
     if (!p.buf.linear_fp8_scratch) return cudaErrorInvalidValue;
     err = sa_q_fp8
@@ -2442,34 +2471,35 @@ cudaError_t cosmos_run_transformer_block_streaming(
                                          M * B, K, K, /*gelu=*/false, stream)
         : cosmos_linear_bf16_or_fp8(p, normed, p.w.sa_w_q, p.w.sa_w_q_scale, q_row,
                                     M * B, K, K, /*gelu=*/false, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     err = sa_k_fp8
         ? cosmos_linear_prequantized_fp8(p, p.buf.linear_fp8_scratch, p.w.sa_w_k, p.w.sa_w_k_scale, k_row,
                                          M * B, K, K, /*gelu=*/false, stream)
         : cosmos_linear_bf16_or_fp8(p, normed, p.w.sa_w_k, p.w.sa_w_k_scale, k_row,
                                     M * B, K, K, /*gelu=*/false, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     err = sa_v_fp8
         ? cosmos_linear_prequantized_fp8(p, p.buf.linear_fp8_scratch, p.w.sa_w_v, p.w.sa_w_v_scale, v_row,
                                          M * B, K, K, /*gelu=*/false, stream)
         : cosmos_linear_bf16_or_fp8(p, normed, p.w.sa_w_v, p.w.sa_w_v_scale, v_row,
                                     M * B, K, K, /*gelu=*/false, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   } else {
     err = cosmos_linear_bf16_or_fp8_prepared(
         p, normed, p.w.sa_w_q, nullptr, p.w.sa_w_q_scale, q_row,
         M * B, K, K, /*gelu=*/false, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     err = cosmos_linear_bf16_or_fp8_prepared(
         p, normed, p.w.sa_w_k, nullptr, p.w.sa_w_k_scale, k_row,
         M * B, K, K, /*gelu=*/false, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     err = cosmos_linear_bf16_or_fp8_prepared(
         p, normed, p.w.sa_w_v, nullptr, p.w.sa_w_v_scale, v_row,
         M * B, K, K, /*gelu=*/false, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   }
   rec(EV_AFTER_SA_QKV);
+  COSMOS_DBG_SYNC("after_sa_qkv");
 
   // 1c-1e) Per-head RMSNorm, RoPE, Q FP8 production, and KV cache write.
   bf16* q_bmhk = p.buf.q_bmhk;
@@ -2490,7 +2520,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
         p.k_self_cache,
         p.v_self_cache,
         B, M, H, D, p.self_attn_write_start, p.self_attn_cache_cap, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   } else if (use_fused_fp8_qkv && quantized_attention) {
     if (sage3_fp8_attention) {
       if (!p.buf.attn_q_sage3_fp4 || !p.buf.attn_q_sage3_sf) {
@@ -2501,7 +2531,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
           p.buf.attn_q_sage3_fp4, p.buf.attn_q_sage3_sf,
           B, M, H, D, 3 * K, /*input_head_offset=*/0,
           /*apply_rope=*/true, sage3_q_padded, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
       q_attn_sage3_fp4 = p.buf.attn_q_sage3_fp4;
       q_attn_sage3_sf = p.buf.attn_q_sage3_sf;
     }
@@ -2525,7 +2555,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
         p.v_self_cache_fp8_bhmd,
         p.v_self_cache_fp8_bhdm,
         B, M, H, D, p.self_attn_write_start, p.self_attn_cache_cap, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     q_attn_fp8 = sage3_fp8_attention ? nullptr : p.buf.attn_q_fp8;
     q_attn_fp8_bhmd = q_bhmd_out;
   } else {
@@ -2533,10 +2563,10 @@ cudaError_t cosmos_run_transformer_block_streaming(
     // buffers viewed as [B*M, H, D].
     if (!sage3_fp8_attention) {
       err = cosmos_rmsnorm_per_head<bf16>(q_row, p.w.sa_q_norm, B, M, H, D, 1e-6f, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
     err = cosmos_rmsnorm_per_head<bf16>(k_row, p.w.sa_k_norm, B, M, H, D, 1e-6f, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
     if (quantized_attention) {
       if (sage3_fp8_attention) {
@@ -2548,7 +2578,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
             p.buf.attn_q_sage3_fp4, p.buf.attn_q_sage3_sf,
             B, M, H, D, H * D, /*input_head_offset=*/0,
             /*apply_rope=*/true, sage3_q_padded, stream);
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
         q_attn_sage3_fp4 = p.buf.attn_q_sage3_fp4;
         q_attn_sage3_sf = p.buf.attn_q_sage3_sf;
       } else {
@@ -2556,17 +2586,17 @@ cudaError_t cosmos_run_transformer_block_streaming(
             self_fp8_cudnn_bhmd_input ? p.buf.attn_q_bhmd_fp8 : nullptr;
         err = cosmos_pack_rope_to_fp8<bf16>(
             q_row, p.rope_cos, p.rope_sin, p.buf.attn_q_fp8, q_bhmd_out, B, M, H, D, stream);
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
         q_attn_fp8 = p.buf.attn_q_fp8;
         q_attn_fp8_bhmd = q_bhmd_out;
       }
     } else {
       err = cosmos_pack_rope<bf16>(q_row, p.rope_cos, p.rope_sin, q_bmhk, B * M, H, D, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
     if (!p.fp8_kv_cache_enabled) {
       err = cosmos_pack_rope<bf16>(k_row, p.rope_cos, p.rope_sin, k_bmhk, B * M, H, D, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
     // V: identity copy (V_row -> V_bmhk). Since K = H*D, the layouts are
     // byte-equivalent and we can avoid the kernel; just alias the pointer.
@@ -2583,15 +2613,16 @@ cudaError_t cosmos_run_transformer_block_streaming(
           p.k_self_cache_fp8, p.v_self_cache_fp8,
           p.k_self_cache_fp8_bhmd, p.v_self_cache_fp8_bhmd, p.v_self_cache_fp8_bhdm,
           B, M, H, D, p.self_attn_write_start, p.self_attn_cache_cap, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     } else {
       err = cosmos_write_kv_cache<bf16>(
           k_bmhk, v_bmhk, p.k_self_cache, p.v_self_cache,
           B, M, H, D, p.self_attn_write_start, p.self_attn_cache_cap, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
   }
   rec(EV_AFTER_SA_POST_QKV);
+  COSMOS_DBG_SYNC("after_sa_post_qkv");
 
   // 1f) cuDNN FMHA against the historical cache + just-written tokens.
   //     Q is [B*M, H, D]; K, V are [B*read_end, H, D] (the valid prefix of
@@ -2635,7 +2666,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
       sa_attn_writes_fp8 ? p.buf.linear_fp8_scratch : nullptr,
       read_end, !sa_out_proj_from_quantized_attention, sa_attn_writes_fp8,
       /*allow_sparge_backend=*/true, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_SA_FMHA);
 
   // 1g) Unpack [M, H, D] -> [M, K]. Same byte layout when K = H*D, so
@@ -2680,9 +2711,9 @@ cudaError_t cosmos_run_transformer_block_streaming(
         p, attn_out_row, p.w.sa_w_out, p.w.sa_w_out_prepared, p.w.sa_w_out_scale,
         p.x, gate_sa, M * B, K, K, stream);
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   err = cosmos_trace_copy(p.trace_sa_out, p.x, p.trace_elems, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_SA_OUT);
 
   // ===========================================================================
@@ -2698,7 +2729,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
     err = cosmos_layernorm_modulate<bf16>(
         p.x, shift_ca, scale_ca, normed, M * B, K, B, 1e-6f, stream);
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
   // 2b) CA Q projection (no K/V projection; encoder K/V are pre-cached).
   if (ca_q_fp8) {
@@ -2709,7 +2740,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
         p, normed, p.w.ca_w_q, p.w.ca_w_q_prepared, p.w.ca_w_q_scale, q_row,
         M * B, K, K, /*gelu=*/false, stream);
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
 
   // 2c) Per-head Q RMSNorm. No RoPE on cross-attn. For quantized attention,
   // emit the post-RMSNorm Q directly as FP8 here so the attention launcher
@@ -2736,7 +2767,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
           p.buf.attn_q_sage3_fp4, p.buf.attn_q_sage3_sf,
           B, M, H, D, H * D, /*input_head_offset=*/0,
           /*apply_rope=*/false, sage3_q_padded, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
       ca_q_attn_sage3_fp4 = p.buf.attn_q_sage3_fp4;
       ca_q_attn_sage3_sf = p.buf.attn_q_sage3_sf;
     } else {
@@ -2744,13 +2775,13 @@ cudaError_t cosmos_run_transformer_block_streaming(
           cross_fp8_cudnn_bhmd_input ? p.buf.attn_q_bhmd_fp8 : nullptr;
       err = cosmos_rmsnorm_per_head_to_fp8<bf16>(
           q_row, p.w.ca_q_norm, p.buf.attn_q_fp8, ca_q_bhmd_out, B, M, H, D, 1e-6f, stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
       ca_q_attn_fp8 = p.buf.attn_q_fp8;
       ca_q_attn_fp8_bhmd = ca_q_bhmd_out;
     }
   } else {
     err = cosmos_rmsnorm_per_head<bf16>(q_row, p.w.ca_q_norm, B, M, H, D, 1e-6f, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   }
   rec(EV_AFTER_CA_LN_Q);
 
@@ -2793,7 +2824,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
       ca_attn_writes_fp8 ? p.buf.linear_fp8_scratch : nullptr,
       Mk_c, !ca_out_proj_from_quantized_attention, ca_attn_writes_fp8,
       /*allow_sparge_backend=*/false, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_CA_FMHA);
 
   // 2e) CA out projection (and possibly fused MLP LN/modulate -> FP8).
@@ -2828,9 +2859,9 @@ cudaError_t cosmos_run_transformer_block_streaming(
         p, o_bmhk, p.w.ca_w_out, p.w.ca_w_out_prepared, p.w.ca_w_out_scale,
         p.x, gate_ca, M * B, K, K, stream);
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   err = cosmos_trace_copy(p.trace_ca_out, p.x, p.trace_elems, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_CA_OUT);
 
   // ===========================================================================
@@ -2846,7 +2877,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
     err = cosmos_layernorm_modulate<bf16>(
         p.x, shift_ml, scale_ml, normed, M * B, K, B, 1e-6f, stream);
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_MLP_LN);
 
   // 3b) FFN GEMM1 + GELU: [M, K] x [K, FF] -> [M, FF]
@@ -2857,7 +2888,7 @@ cudaError_t cosmos_run_transformer_block_streaming(
     err = cosmos_linear_prequantized_fp8_output(
         p, p.buf.linear_fp8_scratch, p.w.ffn_w1, p.w.ffn_w1_scale, p.buf.linear_fp8_scratch,
         M * B, K, FF, /*gelu=*/true, stream, ffn1_gelu_fp8_scale);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   } else {
     err = ffn1_fp8
         ? cosmos_linear_prequantized_fp8(
@@ -2866,41 +2897,41 @@ cudaError_t cosmos_run_transformer_block_streaming(
         : cosmos_linear_bf16_or_fp8_prepared(
             p, normed, p.w.ffn_w1, p.w.ffn_w1_prepared, p.w.ffn_w1_scale, p.buf.ffn_intermediate,
             M * B, K, FF, /*gelu=*/true, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     if (p.fp8_activation_amax_out) {
       err = cosmos_record_bf16_absmax(
           p.buf.ffn_intermediate,
           p.fp8_activation_amax_out + kCosmosFp8ActivationScaleFfn1Gelu,
           int64_t(M) * B * FF,
           stream);
-      if (err != cudaSuccess) return err;
+      if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
     }
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_FFN1);
 
   if (ffn1_fp8 && ffn2_fp8) {
     err = cosmos_linear_prequantized_fp8_residual(
         p, p.buf.linear_fp8_scratch, p.w.ffn_w2, p.w.ffn_w2_scale,
         p.x, gate_ml, M * B, FF, K, stream, ffn1_gelu_fp8_scale);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   } else if (ffn2_fp8) {
     err = cosmos_linear_bf16_input_fp8_residual(
         p, p.buf.ffn_intermediate, p.w.ffn_w2, p.w.ffn_w2_scale,
         p.x, gate_ml, M * B, FF, K, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   } else {
     err = cosmos_linear_bf16_or_fp8_residual_prepared(
         p, p.buf.ffn_intermediate, p.w.ffn_w2, p.w.ffn_w2_prepared, p.w.ffn_w2_scale,
         p.x, gate_ml, M * B, FF, K, stream);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   }
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_FFN2);
   err = cosmos_trace_copy(p.trace_ffn_out, p.x, p.trace_elems, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   err = cosmos_trace_copy(p.trace_block_out, p.x, p.trace_elems, stream);
-  if (err != cudaSuccess) return err;
+  if (err != cudaSuccess) { COSMOS_DBG_FAIL(); return err; }
   rec(EV_AFTER_DONE);
 
   if (prof) {
