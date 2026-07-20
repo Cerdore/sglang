@@ -424,6 +424,7 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                name=self.unique_name,
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
