@@ -367,6 +367,13 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # NCCL EP backend (LL decode path): the dispatch algorithm selected for the
+    # nccl4py-backed EP all-to-all. Only LOW_LATENCY is implemented; the value
+    # is a NcclEpMode enum (layers.moe.utils).
+    nccl_ep_mode: Any = None
+    # Per-rank dispatch token budget for the NCCL EP group (Group-level fixed,
+    # see nccl_ep.py). 0 means "not set, use the backend default".
+    nccl_ep_num_max_dispatch_tokens_per_rank: int = 0
 
 
 @dataclasses.dataclass

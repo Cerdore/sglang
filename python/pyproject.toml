@@ -98,6 +98,10 @@ default = true
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+# NCCL EP MoE A2A backend (low-latency decode). Requires CUDA 13 + NCCL >= 2.29
+# (Device API / GIN) on a Hopper (sm_90) or Blackwell GPU. torch's bundled NCCL
+# may be < 2.29; install nvidia-nccl-cu13 and LD_PRELOAD it if so.
+nccl_ep = ["nccl4py[cu13]"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",

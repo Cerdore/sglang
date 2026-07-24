@@ -277,7 +277,13 @@ MOE_A2A_BACKEND_CHOICES = [
     "flashinfer",
     "megamoe",
     "ascend_tp",
+    "nccl_ep",
 ]
+
+
+def _deepep_importable() -> bool:
+    """Whether the deep_ep package is importable (for NCCL EP fallback)."""
+    return importlib.util.find_spec("deep_ep") is not None
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
@@ -2199,6 +2205,7 @@ class ServerArgs:
             "flashinfer",
             "megamoe",
             "ascend_tp",
+            "nccl_ep",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -2282,6 +2289,21 @@ class ServerArgs:
         "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
         NS("exec.moe"),
     ] = None
+    nccl_ep_mode: A[
+        Literal["low_latency", "auto"],
+        "Select the NCCL EP dispatch algorithm. Only `low_latency` (decode) is "
+        "implemented in this PR; `auto` also resolves to low_latency. The "
+        "high-throughput (prefill) path is a follow-up.",
+        NS("exec.moe"),
+    ] = "low_latency"
+    nccl_ep_num_max_dispatch_tokens_per_rank: A[
+        int,
+        "Per-rank dispatch token budget for the NCCL EP group (Group-level "
+        "fixed). Each rank's decode batch must not exceed it or the NCCL EP "
+        "combine assert fires. Mirrors SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK. "
+        "0 = use the backend default (capped at 1024).",
+        NS("exec.moe"),
+    ] = 0
     moe_dense_tp_size: A[
         Optional[int],
         Arg(
@@ -6362,6 +6384,33 @@ class ServerArgs:
                     "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) "
                     "must be >= the per-rank MoRI dispatch tokens "
                     "(chunked_prefill_size by default)"
+                )
+
+        if a2a_backend == "nccl_ep":
+            # Capability detection + graceful fallback. NCCL EP requires:
+            #   - nccl4py (nccl.ep) importable
+            #   - Hopper (sm_90) or Blackwell; CUDA 13; NCCL >= 2.29
+            # When unavailable, fall back to none (then deepep if usable) so the
+            # server still starts. cu12 builds cannot install nccl4py[cu13].
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+                is_nccl_ep_available,
+                nccl_ep_capability_reason,
+            )
+            if not is_nccl_ep_available():
+                reason = nccl_ep_capability_reason()
+                fallback = "deepep" if _deepep_importable() else "none"
+                logger.warning(
+                    f"NCCL EP MoE requested but unavailable ({reason}); "
+                    f"falling back to moe_a2a_backend='{fallback}'. "
+                    f"Install nccl4py[cu13] on a CUDA13 + NCCL>=2.29 Hopper/Blackwell box."
+                )
+                self.moe_a2a_backend = fallback
+            else:
+                logger.warning(
+                    f"NCCL EP MoE is enabled. The expert parallel size is adjusted "
+                    f"to be the same as the tensor parallel size[{self.tp_size}]. "
+                    f"NCCL EP currently supports the low-latency (decode) path only; "
+                    f"prefill falls through to DeepEP normal."
                 )
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
