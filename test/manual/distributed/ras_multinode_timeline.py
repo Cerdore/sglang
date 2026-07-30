@@ -19,7 +19,7 @@ Usage (see ras_multinode_README.md for the full 2-node launch)::
 
 Env:
     RAS_HOST / RAS_PORT   - where node0's RAS socket is reachable from this
-                            process (default 127.0.0.1 / 28028).
+                            process (default localhost / 28028).
     NODE1_SSH             - ssh target for the node running rank1 (e.g.
                             ``user@10.0.0.2``). Required to kill rank1.
     POLL_SECONDS          - how long to poll after the kill (default 120).
@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-HOST = os.environ.get("RAS_HOST", "127.0.0.1")
+HOST = os.environ.get("RAS_HOST", "localhost")
 PORT = int(os.environ.get("RAS_PORT", "28028"))
 NODE1_SSH = os.environ.get("NODE1_SSH")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))

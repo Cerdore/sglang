@@ -60,7 +60,7 @@ def sh(cmd, timeout=20):
 
 def poll_ras():
     try:
-        s = socket.create_connection(("127.0.0.1", RAS_PORT), timeout=2)
+        s = socket.create_connection(("localhost", RAS_PORT), timeout=2)
     except OSError:
         return None
     s.settimeout(2)
