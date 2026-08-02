@@ -793,14 +793,17 @@ class DeepseekMLAForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
-                if dcp_comm_backend in ("a2a", "fi_a2a"):
+                if dcp_comm_backend in ("a2a", "fi_a2a", "symm_a2a"):
                     # A2A exchange of head partials + LSE, then local Triton combine.
+                    # symm_a2a fuses the peer exchange and LSE combine in its own
+                    # CUDA kernel sequence instead of the Triton combine.
                     attn_output = dcp_a2a_lse_reduce(
                         attn_output.contiguous(),
                         lse.contiguous(),
                         get_parallel().dcp_group,
                         is_lse_base_on_e=is_lse_base_on_e,
                         comm_backend=dcp_comm_backend,
+                        ubatch_id=getattr(forward_batch, "ubatch_id", 0),
                     )
                 else:
                     attn_output = cp_lse_ag_out_rs_mla(
