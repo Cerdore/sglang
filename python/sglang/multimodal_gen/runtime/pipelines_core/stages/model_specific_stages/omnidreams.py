@@ -535,8 +535,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         """
         hdmap = getattr(batch, "hdmap_path", None)
         if hdmap is None:
-            hdmap = getattr(batch, "hdmap_pixels", None)
-        if hdmap is None:
             return None, None
 
         # L latent frames total -> 1 + (L-1)*4 pixel frames (causal VAE, tc=4),

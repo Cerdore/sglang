@@ -439,7 +439,6 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "diffusers_kwargs": request.diffusers_kwargs,
         # OmniDreams HDMap / trajectory conditioning (Phase 4).
         "hdmap_path": request.hdmap_path,
-        "num_views": request.num_views,
         **cosmos3_kwargs,
     }
 
