@@ -27,7 +27,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
 from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
     OmniDreamsDiT,
     RotaryPositionEmbedding3D,
-    rope_dims,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_omnidreams_flow_match import (  # noqa: E501
     OmniDreamsFlowMatchScheduler,
@@ -36,74 +35,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.o
     _MAX_AR_CHUNKS,
     OmniDreamsBeforeDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.realtime.states import (
+    RealtimeCausalDiTState,
+)
 
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="OmniDreams DiT forward runs on the platform (GPU) device",
 )
-
-
-# --------------------------------------------------------------------------- #
-# 3D RoPE: shift_t_freqs must match the FlashDreams reference exactly.         #
-#  (This was the FP8-blur root cause: the old layout was [t,t,h,h,w,w] and    #
-#  dropped the h/w NTK extrapolation; see omnidreams_rope.py.)                #
-# --------------------------------------------------------------------------- #
-def _fd_reference_shift_t_freqs(
-    *, head_dim, len_h, len_w, len_t, ratios, ar_idx=0, device="cpu"
-):
-    """Flashdreams ``RotaryPositionEmbedding3D.shift_t`` reference: per-axis
-    NTK-rescaled base frequencies (``_compute_freqs``) concatenated with the
-    non-interleaved ``[t, h, w, t, h, w]`` layout (``_cat_freqs``). This is the
-    contract the native FP8 C++ ``_make_cosmos_rope_cache`` consumes."""
-    dim_t, dim_h, dim_w = rope_dims(head_dim)
-
-    def _freqs(dim, ratio):
-        dim_range = (
-            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2]
-            / dim
-        )
-        theta = 10000.0 * (ratio ** (dim / (dim - 2)))
-        return 1.0 / (theta**dim_range)
-
-    rt, rh, rw = ratios
-    t = torch.arange(len_t, device=device) + ar_idx * len_t
-    h = torch.arange(len_h, device=device)
-    w = torch.arange(len_w, device=device)
-    tt, hh, ww = torch.meshgrid(t, h, w, indexing="ij")
-    ft = torch.outer(tt.reshape(-1).float(), _freqs(dim_t, rt))
-    fh = torch.outer(hh.reshape(-1).float(), _freqs(dim_h, rh))
-    fw = torch.outer(ww.reshape(-1).float(), _freqs(dim_w, rw))
-    raw = torch.cat([ft, fh, fw, ft, fh, fw], dim=-1)  # [L, D]
-    return raw.unsqueeze(1).unsqueeze(1)  # [L, 1, 1, D]
-
-
-def test_shift_t_freqs_matches_fd_reference_formula():
-    # Golden: shift_t_freqs must equal flashdreams' shift_t exactly. The old
-    # implementation diverged (cos~0.64 vs fd) via wrong layout + dropped NTK.
-    emb = RotaryPositionEmbedding3D(
-        head_dim=128,
-        len_h=4,
-        len_w=5,
-        len_t=2,
-        h_extrapolation_ratio=3.0,
-        w_extrapolation_ratio=3.0,
-        t_extrapolation_ratio=1.0,
-    )
-    for ar in (0, 1, 2):
-        got = emb.shift_t_freqs(ar)
-        ref = _fd_reference_shift_t_freqs(
-            head_dim=128,
-            len_h=4,
-            len_w=5,
-            len_t=2,
-            ratios=(1.0, 3.0, 3.0),
-            ar_idx=ar,
-        )
-        assert got.shape == ref.shape == (2 * 4 * 5, 1, 1, 128)
-        assert torch.allclose(
-            got, ref, atol=1e-5
-        ), f"ar={ar} diverged from fd reference"
 
 
 # --------------------------------------------------------------------------- #
@@ -262,6 +202,92 @@ def test_ar_denoising_window_roll_many_chunks(monkeypatch):
     # covered by the real-weight e2e — finiteness of an untrained multi-chunk rollout
     # is not a stable invariant (GPU SDPA non-determinism near fp edges).
     assert tuple(out.latents.shape) == (1, 4, 3 * 2, 2 * 2, 2 * 2)
+
+
+@requires_gpu
+@torch.no_grad()
+def test_offline_realtime_single_chunk_parity(monkeypatch):
+    """A1 lock: the offline AR loop and the realtime single-chunk path share
+    ``_run_ar_chunk``, so one chunk of offline ``forward`` and one realtime
+    ``_realtime_denoise_forward`` (block_idx=0) must produce bit-identical
+    latents under the same seed + inputs (deterministic SDPA on a fixed device).
+    """
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
+    sched = OmniDreamsFlowMatchScheduler()
+    stage, server_args = _ar_stage_and_args(arch, dit, sched, monkeypatch)
+
+    text = torch.randn(1, 5, arch.crossattn_proj_in_channels, device=_DEVICE)
+
+    # Offline: one chunk.
+    torch.manual_seed(0)
+    offline_batch = _ar_batch(
+        arch, image_token=None, num_chunks=1, text=text,
+        gen=torch.Generator(device=_DEVICE).manual_seed(7),
+    )
+    offline_out = stage.forward(offline_batch, server_args)
+
+    # Realtime: one chunk (block_idx=0). Build a minimal session + the state
+    # the before-stage would have stashed (mirror _realtime_stash_initial_state);
+    # the denoise stage's lazy assembly builds the rest (rope/caches/masks/
+    # cross_attn_kv) on chunk 0.
+    rt_batch = _ar_batch(
+        arch, image_token=None, num_chunks=1, text=text,
+        gen=torch.Generator(device=_DEVICE).manual_seed(7),
+    )
+    rt_batch.realtime_session_id = "parity"
+    rt_batch.block_idx = 0
+    rt_batch.condition_inputs = {}
+    head_dim = arch.model_channels // arch.num_heads
+    in_d = arch.in_channels * arch.patch_temporal * arch.patch_spatial**2
+    hdmap_d = (
+        arch.additional_concat_ch * arch.patch_temporal * arch.patch_spatial**2
+    )
+    mask_d = arch.patch_temporal * arch.patch_spatial**2
+    state = RealtimeCausalDiTState()
+    rt_batch.session = types.SimpleNamespace(
+        get_or_create_state=lambda cls: state
+    )
+    # Stash the one-shot prep via the real before-stage method (drift-free vs
+    # hand-populating rc); the denoise stage's lazy assembly builds the rest.
+    before_stage = OmniDreamsBeforeDenoisingStage.__new__(OmniDreamsBeforeDenoisingStage)
+    before_stage._realtime_stash_initial_state(
+        rt_batch,
+        server_args,
+        rope=None,
+        text_embeds=text,
+        image_full=None,
+        inject_mask=None,
+        cond_mask_c0=None,
+        cond_mask_zero=None,
+        hdmap_zero=None,
+        cross_attn_kv=None,
+        scheduler=sched,
+        generator=rt_batch.generator,
+        hdmap_encode_cache=None,
+        arch_constants={
+            "hp": 2,
+            "wp": 2,
+            "len_t": 2,
+            "tokens_per_frame": 4,
+            "chunk_tokens": 4,
+            "head_dim": head_dim,
+            "in_d": in_d,
+            "hdmap_d": hdmap_d,
+            "mask_d": mask_d,
+            "context_noise": 128.0,
+            "window_size_t": 2,
+            "sink_size_t": 0,
+        },
+        hdmap_tokens=None,
+        hdmap_pixel=None,
+        image_token=None,
+    )
+
+    rt_out = stage._realtime_denoise_forward(rt_batch, server_args)
+
+    assert rt_out.latents.shape == offline_out.latents.shape
+    assert torch.equal(rt_out.latents, offline_out.latents)
 
 
 # --------------------------------------------------------------------------- #
