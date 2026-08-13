@@ -483,30 +483,27 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         batch: Req,
         device: torch.device,
         vae_dtype: torch.dtype,
-        dit_dtype: torch.dtype,
         num_chunks: int,
         len_t: int,
         height: int,
         width: int,
-    ) -> tuple[list[torch.Tensor] | None, torch.Tensor | None]:
+    ) -> torch.Tensor | None:
         """Prepare HD-map conditioning for the AR loop.
 
-        Returns ``(hdmap_tokens, hdmap_pixel)``:
+        Returns a single preprocessed pixel clip ``hdmap_pixel``
+        ``[B, 3, total_pixel, H, W]`` on ``device``, or ``None`` when there is no
+        HD-map input (the AR stage falls back to zeros). The per-chunk VAE encode
+        + patchify is **deferred to the AR loop** (see
+        :class:`OmniDreamsDenoisingStage`), aligning with the FlashDreams replay
+        path (one-shot decode + per-step slice encode) and enabling per-step
+        closed-loop conditioning where each chunk's pixels arrive at runtime.
 
-        * No HD-map input -> ``(None, None)`` (AR stage falls back to zeros).
-        * Degenerate single-image fallback -> ``(tokens, None)``: the single
-          raster is VAE-encoded once here and broadcast across every latent
-          frame, then sliced into ``num_chunks`` precomputed patchified tokens
-          (no temporal motion -- back-compat / smoke only).
-        * Per-frame (video) path -> ``(None, hdmap_pixel)``: the full per-frame
-          raster sequence is decoded once (``load_video`` / A+B fast path) and
-          preprocessed into one causal clip ``hdmap_pixel``
-          ``[B, 3, total_pixel, H, W]`` on ``device``. The per-chunk VAE encode
-          + patchify is **deferred to the AR loop** (see
-          :class:`OmniDreamsDenoisingStage`), aligning with the FlashDreams
-          replay path (one-shot decode + per-step slice encode) and enabling
-          per-step closed-loop conditioning where each chunk's pixels arrive at
-          runtime.
+        Paths (both produce the same clip contract):
+        * per-frame (video): the full raster sequence decoded once (``load_video``
+          / A+B fast path) into one causal clip;
+        * degenerate single-image: the single raster preprocessed once and
+          broadcast into a static repeated-frame clip (no temporal motion --
+          back-compat / smoke only), routed through the same pixel path.
 
         HD-map is OmniDreams' central per-frame control signal (lane lines +
         actor boxes rendered at the ego pose); the generated viewpoint changes
@@ -514,7 +511,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         """
         hdmap = getattr(batch, "hdmap_path", None)
         if hdmap is None:
-            return None, None
+            return None
 
         # L latent frames total -> 1 + (L-1)*4 pixel frames (causal VAE, tc=4),
         # matching the output chunk math (chunk0=1+(len_t-1)*4, later=len_t*4).
@@ -541,41 +538,23 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                 )
                 clip = None
             if clip is not None:
-                return None, clip
+                return clip
             # Fall through to the legacy path below on failure.
 
         frames = self._resolve_hdmap_frames(hdmap)
         if frames is None:
-            # Degenerate single-image fallback: one raster broadcast across all
-            # latent frames (no temporal motion -- back-compat / smoke only).
+            # Degenerate single-image fallback: preprocess the single raster
+            # once and broadcast it into a static repeated-frame clip (no
+            # temporal motion), routed through the same per-frame pixel path.
+            # No FlashDreams precedent for a precomputed-token broadcast path.
             x = self._preprocess_pixels(hdmap, height, width, device, vae_dtype)
             if x is None:
                 logger.warning(
                     "OmniDreams: HD-map preprocessed to None; disabling HDMap "
                     "(all chunks fall back to zeros). Check hdmap input."
                 )
-                return None, None
-            latent = _vae_encode_normalized(x, self.encoder).to(
-                dit_dtype
-            )  # [B,16,1,h,w]
-            if num_latent > 1 and latent.ndim == 5 and latent.shape[2] == 1:
-                latent = latent.repeat(1, 1, num_latent, 1, 1)
-            if latent.shape[2] != num_latent:
-                logger.warning(
-                    "OmniDreams: HD-map encoded to %d latent frames, expected %d "
-                    "(num_chunks=%d, len_t=%d). Check VAE temporal compression.",
-                    latent.shape[2],
-                    num_latent,
-                    num_chunks,
-                    len_t,
-                )
-            # Slice into per-chunk groups of len_t latent frames, patchify each:
-            # [B,16,len_t,h,w] -> [B, chunk_tokens, additional_concat_ch*pdim].
-            tokens: list[torch.Tensor] = []
-            for ci in range(num_chunks):
-                chunk_latent = latent[:, :, ci * len_t : (ci + 1) * len_t]
-                tokens.append(self.transformer.patchify(chunk_latent))
-            return tokens, None
+                return None
+            return x.repeat(1, 1, total_pixel, 1, 1)  # [B,3,total_pixel,H,W]
 
         # Per-frame (video) path: decode + preprocess the full causal clip once
         # here (one-shot decode, matching FlashDreams ``_load_video``); defer the
@@ -599,8 +578,8 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                 "OmniDreams: HD-map clip preprocessed to None; disabling "
                 "HDMap (all chunks fall back to zeros). Check hdmap input."
             )
-            return None, None
-        return None, clip
+            return None
+        return clip
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -687,11 +666,13 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         # HD-map prep. The per-frame video path returns a preprocessed pixel clip
         # (``hdmap_pixel``) whose per-chunk VAE encode + patchify is deferred to
         # the AR loop (FlashDreams replay: one-shot decode + per-step encode);
-        # the degenerate single-image fallback returns precomputed per-chunk
-        # tokens. No HD-map input -> (None, None) (AR stage uses zeros).
+        # HD-map prep. Returns a preprocessed pixel clip (``hdmap_pixel``) whose
+        # per-chunk VAE encode + patchify is deferred to the AR loop (FlashDreams
+        # replay: one-shot decode + per-step encode); ``None`` when there is no
+        # HD-map input (the AR stage uses zeros).
         with self.use_declared_component(component_name="encoder", module=self.encoder):
-            hdmap_tokens, hdmap_pixel = self._encode_hdmap(
-                batch, device, vae_dtype, dit_dtype, num_chunks, len_t, height, width
+            hdmap_pixel = self._encode_hdmap(
+                batch, device, vae_dtype, num_chunks, len_t, height, width
             )
             # Keep the full hdmap pixel clip on CPU; the AR loop brings
             # each small per-chunk slice to GPU for encode (~13GB saved
@@ -711,14 +692,10 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             "sink_size_t": int(getattr(batch, "sink_size_t", 0)),
             "context_noise": float(getattr(batch, "context_noise", 128)),
             "image_token": image_token,  # [B, hp*wp, in*pdim] or None
-            # HD-map, in two mutually-exclusive shapes (both None = disabled):
-            #  * ``hdmap_tokens``: None, or list[num_chunks] of precomputed
-            #    [B, chunk_tokens, additional_concat_ch*pdim] (single-image
-            #    broadcast fallback only);
-            #  * ``hdmap_pixel``: None, or a full preprocessed clip
-            #    [B, 3, total_pixel, H, W] -- per-chunk VAE-encoded in the AR
-            #    loop (the per-frame video path).
-            "hdmap_tokens": hdmap_tokens,
+            # ``hdmap_pixel``: None, or a full preprocessed clip
+            # [B, 3, total_pixel, H, W] -- per-chunk VAE-encoded in the AR
+            # loop (the per-frame video path; a single image becomes a static
+            # repeated-frame clip).
             "hdmap_pixel": hdmap_pixel,
         }
         # raw_latent_shape lets SDPA-path attn metadata stay a no-op.
@@ -768,7 +745,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                     "window_size_t": int(getattr(batch, "window_size_t", 6)),
                     "sink_size_t": int(getattr(batch, "sink_size_t", 0)),
                 },
-                hdmap_tokens=hdmap_tokens,
                 hdmap_pixel=hdmap_pixel,
                 image_token=image_token,
             )
@@ -794,7 +770,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         generator,
         hdmap_encode_cache,
         arch_constants: dict,
-        hdmap_tokens,
         hdmap_pixel,
         image_token,
     ) -> None:
@@ -823,12 +798,9 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         rc["generator"] = generator
         rc["hdmap_encode_cache"] = hdmap_encode_cache
         rc["arch_constants"] = dict(arch_constants)
-        # HD-map conditioning (one of these is non-None when HDMap is enabled):
-        #  * ``hdmap_tokens``: list[num_chunks] precomputed per-chunk tokens
-        #    (single-image broadcast fallback);
-        #  * ``hdmap_pixel``: full preprocessed clip on CPU, per-chunk slices
-        #    VAE-encoded in the denoise loop (per-frame video path).
-        rc["hdmap_tokens"] = hdmap_tokens
+        # HD-map conditioning: ``hdmap_pixel`` is the full preprocessed clip on
+        # CPU, per-chunk slices VAE-encoded in the denoise loop (per-frame video
+        # path; a single image becomes a static repeated-frame clip).
         rc["hdmap_pixel"] = hdmap_pixel
         cache_state.kv_cache = None  # initialized in the denoise stage
         cache_state.chunk_idx = 0
@@ -880,7 +852,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             "sink_size_t": ac["sink_size_t"],
             "context_noise": ac["context_noise"],
             "image_token": rc["image_token"],
-            "hdmap_tokens": rc["hdmap_tokens"],
             "hdmap_pixel": rc["hdmap_pixel"],
             # Per-chunk closed-loop override (highest priority in the denoise
             # stage's HDMap resolution).
@@ -970,7 +941,6 @@ class _ARChunkCtx(msgspec.Struct, frozen=True):
     hdmap_zero: torch.Tensor
     hdmap_pixel_chunk: Any  # closed-loop per-chunk pixels (realtime only)
     hdmap_pixel: Any  # stashed full clip, sliced per chunk
-    hdmap_tokens: list | None  # precomputed per-chunk tokens (single-image fallback)
     hdmap_encode_cache: Any
     hp: int
     wp: int
@@ -1308,7 +1278,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             hdmap_zero=hdmap_zero,
             hdmap_pixel_chunk=st.get("hdmap_pixel_chunk"),
             hdmap_pixel=st["hdmap_pixel"],
-            hdmap_tokens=st["hdmap_tokens"],
             hdmap_encode_cache=hdmap_encode_cache,
             hp=hp,
             wp=wp,
@@ -1335,15 +1304,14 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         is_first = chunk_idx == 0
         cond_mask = ctx.cond_mask_c0 if is_first else ctx.cond_mask_zero
 
-        # HD-map conditioning for this chunk, in four mutually-exclusive shapes
+        # HD-map conditioning for this chunk, in three mutually-exclusive shapes
         # (resolution order mirrors the before-stage + closed-loop override):
         #  1. ``hdmap_pixel_chunk``: closed-loop per-chunk pixels from
         #     ``condition_inputs["hdmap"]`` (realtime only). VAE-encoded here.
         #  2. ``hdmap_pixel``: stashed full clip -> slice this chunk's frames
-        #     and VAE-encode (per-frame video path, offline + realtime open-loop).
-        #  3. ``hdmap_tokens``: precomputed per-chunk tokens (single-image
-        #     broadcast fallback).
-        #  4. all None -> zeros (HDMap disabled).
+        #     and VAE-encode (per-frame video path, offline + realtime open-loop;
+        #     a single-image input is a static repeated-frame clip).
+        #  3. all None -> zeros (HDMap disabled).
         if ctx.hdmap_pixel_chunk is not None:
             # Closed-loop pixels arrive as fp32 from the realtime adapter; cast
             # to the encoder's conv dtype (the offline path pre-casts in
@@ -1368,10 +1336,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 is_first_chunk=is_first,
             ).to(ctx.dit_dtype)
             hdmap_chunk = self.transformer.patchify(chunk_latent)
-        elif ctx.hdmap_tokens is not None:
-            hdmap_chunk = ctx.hdmap_tokens[chunk_idx].to(
-                device=ctx.device, dtype=ctx.dit_dtype
-            )
         else:
             hdmap_chunk = ctx.hdmap_zero
 

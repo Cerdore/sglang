@@ -172,7 +172,6 @@ def _ar_batch(
                 "sink_size_t": 0,
                 "context_noise": 128.0,
                 "image_token": image_token,
-                "hdmap_tokens": None,
                 "hdmap_pixel": None,
             }
         },
@@ -278,7 +277,6 @@ def test_offline_realtime_single_chunk_parity(monkeypatch):
             "window_size_t": 2,
             "sink_size_t": 0,
         },
-        hdmap_tokens=None,
         hdmap_pixel=None,
         image_token=None,
     )
