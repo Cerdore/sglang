@@ -252,17 +252,9 @@ def test_offline_realtime_single_chunk_parity(monkeypatch):
     before_stage._realtime_stash_initial_state(
         rt_batch,
         server_args,
-        rope=None,
         text_embeds=text,
-        image_full=None,
-        inject_mask=None,
-        cond_mask_c0=None,
-        cond_mask_zero=None,
-        hdmap_zero=None,
-        cross_attn_kv=None,
         scheduler=sched,
         generator=rt_batch.generator,
-        hdmap_encode_cache=None,
         arch_constants={
             "hp": 2,
             "wp": 2,

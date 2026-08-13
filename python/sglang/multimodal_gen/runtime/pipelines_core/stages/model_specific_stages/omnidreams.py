@@ -716,17 +716,9 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             self._realtime_stash_initial_state(
                 batch,
                 server_args,
-                rope=None,  # built lazily in the denoise stage (needs head_dim)
                 text_embeds=text_embeds,
-                image_full=None,  # assembled in the denoise stage (needs device)
-                inject_mask=None,
-                cond_mask_c0=None,
-                cond_mask_zero=None,
-                hdmap_zero=None,
-                cross_attn_kv=None,  # precomputed in the denoise stage
                 scheduler=scheduler,
                 generator=batch.generator,
-                hdmap_encode_cache=None,
                 arch_constants={
                     "hp": hp,
                     "wp": wp,
@@ -758,45 +750,27 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
         *,
-        rope,
         text_embeds: torch.Tensor,
-        image_full,
-        inject_mask,
-        cond_mask_c0,
-        cond_mask_zero,
-        hdmap_zero,
-        cross_attn_kv,
         scheduler,
         generator,
-        hdmap_encode_cache,
         arch_constants: dict,
         hdmap_pixel,
         image_token,
     ) -> None:
         """Stash one-shot prep into ``RealtimeCausalDiTState.runtime_cache``.
 
-        The denoise stage reads these back on every realtime forward() call.
-        Tensors that need device/dit_dtype assembly (rope, masks, cross_attn_kv,
-        image_full) are built lazily in the denoise stage on the first chunk to
-        avoid duplicating the device-aware construction logic here; only the
-        device-independent inputs (text embeds, image_token, hdmap, scheduler,
-        generator, arch constants) are stashed here.
+        The denoise stage reads these back on the first (chunk-0) realtime
+        forward() to assemble the persistent ``_ARChunkCtx``. Device/dit_dtype-
+        aware tensors (rope, masks, cross-attn K/V, image_full, hdmap encode
+        cache) are built in the denoise stage's chunk-0 assembly, not here.
         """
         cache_state = batch.session.get_or_create_state(RealtimeCausalDiTState)
         rc = cache_state.runtime_cache
         rc.clear()
-        rc["rope"] = rope
         rc["text_embeds"] = text_embeds.detach()
         rc["image_token"] = image_token.detach() if image_token is not None else None
-        rc["image_full"] = image_full
-        rc["inject_mask"] = inject_mask
-        rc["cond_mask_c0"] = cond_mask_c0
-        rc["cond_mask_zero"] = cond_mask_zero
-        rc["hdmap_zero"] = hdmap_zero
-        rc["cross_attn_kv"] = cross_attn_kv
         rc["scheduler"] = scheduler
         rc["generator"] = generator
-        rc["hdmap_encode_cache"] = hdmap_encode_cache
         rc["arch_constants"] = dict(arch_constants)
         # HD-map conditioning: ``hdmap_pixel`` is the full preprocessed clip on
         # CPU, per-chunk slices VAE-encoded in the denoise loop (per-frame video
@@ -939,7 +913,6 @@ class _ARChunkCtx(msgspec.Struct, frozen=True):
     image_full: torch.Tensor | None
     inject_mask: torch.Tensor | None
     hdmap_zero: torch.Tensor
-    hdmap_pixel_chunk: Any  # closed-loop per-chunk pixels (realtime only)
     hdmap_pixel: Any  # stashed full clip, sliced per chunk
     hdmap_encode_cache: Any
     hp: int
@@ -1276,7 +1249,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             image_full=image_full,
             inject_mask=inject_mask,
             hdmap_zero=hdmap_zero,
-            hdmap_pixel_chunk=st.get("hdmap_pixel_chunk"),
             hdmap_pixel=st["hdmap_pixel"],
             hdmap_encode_cache=hdmap_encode_cache,
             hp=hp,
@@ -1289,7 +1261,12 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         )
 
     @torch.no_grad()
-    def _run_ar_chunk(self, ctx: _ARChunkCtx, chunk_idx: int) -> torch.Tensor:
+    def _run_ar_chunk(
+        self,
+        ctx: _ARChunkCtx,
+        chunk_idx: int,
+        hdmap_pixel_chunk: Any = None,
+    ) -> torch.Tensor:
         """One AR chunk body shared by the offline loop and the realtime path.
 
         Numerical parity invariant: this is the single source of truth for the
@@ -1306,17 +1283,17 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         # HD-map conditioning for this chunk, in three mutually-exclusive shapes
         # (resolution order mirrors the before-stage + closed-loop override):
-        #  1. ``hdmap_pixel_chunk``: closed-loop per-chunk pixels from
-        #     ``condition_inputs["hdmap"]`` (realtime only). VAE-encoded here.
+        #  1. ``hdmap_pixel_chunk`` (arg): closed-loop per-chunk pixels
+        #     (realtime only, None offline). VAE-encoded here.
         #  2. ``hdmap_pixel``: stashed full clip -> slice this chunk's frames
         #     and VAE-encode (per-frame video path, offline + realtime open-loop;
         #     a single-image input is a static repeated-frame clip).
         #  3. all None -> zeros (HDMap disabled).
-        if ctx.hdmap_pixel_chunk is not None:
+        if hdmap_pixel_chunk is not None:
             # Closed-loop pixels arrive as fp32 from the realtime adapter; cast
             # to the encoder's conv dtype (the offline path pre-casts in
             # _preprocess_pixels).
-            chunk_clip = ctx.hdmap_pixel_chunk.to(
+            chunk_clip = hdmap_pixel_chunk.to(
                 device=ctx.device, dtype=next(self.encoder.parameters()).dtype
             )
             chunk_latent = _vae_encode_normalized(
@@ -1437,31 +1414,34 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         rc = cache_state.runtime_cache
         st = batch.extra["omnidreams"]
 
-        hp = st["hp"]
-        wp = st["wp"]
-        len_t = st["len_t"]
-        tokens_per_frame = st["tokens_per_frame"]
-        chunk_tokens = st["chunk_tokens"]
-        context_noise = st["context_noise"]
         # chunk_idx is the AR chunk index. cache_state.chunk_idx tracks it
         # (the before-stage inits to 0; we increment after each chunk).
         chunk_idx = cache_state.chunk_idx
 
-        head_dim = rc["arch_constants"]["head_dim"]
-        in_d = rc["arch_constants"]["in_d"]
-        hdmap_d = rc["arch_constants"]["hdmap_d"]
-        mask_d = rc["arch_constants"]["mask_d"]
+        ctx = rc.get("ar_ctx")
+        if ctx is None:
+            # One-time chunk-0 assembly + ctx build. The ctx is loop-invariant
+            # across chunks (the per-chunk hdmap_pixel_chunk is passed to
+            # ``_run_ar_chunk`` directly), so it is built once and reused.
+            hp = st["hp"]
+            wp = st["wp"]
+            len_t = st["len_t"]
+            tokens_per_frame = st["tokens_per_frame"]
+            chunk_tokens = st["chunk_tokens"]
+            context_noise = st["context_noise"]
+            head_dim = rc["arch_constants"]["head_dim"]
+            in_d = rc["arch_constants"]["in_d"]
+            hdmap_d = rc["arch_constants"]["hdmap_d"]
+            mask_d = rc["arch_constants"]["mask_d"]
 
-        scheduler = rc["scheduler"].to(device)
-        text = rc["text_embeds"].to(device=device, dtype=dit_dtype)
-        B = text.shape[0]
-        gen = rc["generator"]
-        if gen is not None and gen.device != device:
-            gen = torch.Generator(device=device).manual_seed(gen.initial_seed())
-            rc["generator"] = gen
+            scheduler = rc["scheduler"].to(device)
+            text = rc["text_embeds"].to(device=device, dtype=dit_dtype)
+            B = text.shape[0]
+            gen = rc["generator"]
+            if gen is not None and gen.device != device:
+                gen = torch.Generator(device=device).manual_seed(gen.initial_seed())
+                rc["generator"] = gen
 
-        # ---- lazy one-shot assembly on chunk 0 (needs device/dit_dtype) ---- #
-        if cache_state.kv_cache is None or rc["rope"] is None:
             rope = RotaryPositionEmbedding3D(
                 head_dim=head_dim,
                 len_h=hp,
@@ -1472,7 +1452,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 t_extrapolation_ratio=1.0,
                 device=device,
             )
-            rc["rope"] = rope
             caches = self.transformer.init_kv_caches(
                 batch_size=B,
                 chunk_tokens=chunk_tokens,
@@ -1511,70 +1490,56 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             hdmap_zero = torch.zeros(
                 B, chunk_tokens, hdmap_d, device=device, dtype=dit_dtype
             )
-            rc["image_full"] = image_full
-            rc["inject_mask"] = inject_mask
-            rc["cond_mask_c0"] = cond_mask_c0
-            rc["cond_mask_zero"] = cond_mask_zero
-            rc["hdmap_zero"] = hdmap_zero
 
             # Precompute cross-attn K/V once (text context is static).
-            rc["cross_attn_kv"] = self.transformer.precompute_cross_attn_kv(
+            cross_attn_kv = self.transformer.precompute_cross_attn_kv(
                 self.transformer.crossattn_proj(text)
             )
 
-            # Initialize the persistent HD-map streaming encode cache (per-frame
-            # video path only) once per session.
+            # Persistent HD-map streaming encode cache (per-frame video path only).
+            hdmap_encode_cache = None
             if st.get("hdmap_pixel") is not None and hasattr(
                 self.encoder, "initialize_ar_encode_cache"
             ):
-                rc["hdmap_encode_cache"] = self.encoder.initialize_ar_encode_cache()
+                hdmap_encode_cache = self.encoder.initialize_ar_encode_cache()
 
-            # FP8 weight-only mode: dequantize once on the first chunk (same
-            # logic as the offline path; the result persists on self.transformer
-            # across calls via the _weight_only_fp8_applied flag).
+            # FP8 weight-only / fp8_compute: apply once on the first chunk.
             mode = getattr(config, "native_dit_acceleration", "disabled")
             if mode == "weight_only_fp8":
                 self._maybe_load_weight_only_fp8(batch, server_args)
             elif mode == "fp8_compute":
                 self._maybe_install_fp8_compute(config, device)
 
-        rope = rc["rope"]
-        caches = cache_state.kv_cache
-        image_full = rc["image_full"]
-        inject_mask = rc["inject_mask"]
-        cond_mask_c0 = rc["cond_mask_c0"]
-        cond_mask_zero = rc["cond_mask_zero"]
-        hdmap_zero = rc["hdmap_zero"]
-        cross_attn_kv = rc["cross_attn_kv"]
-        hdmap_encode_cache = rc["hdmap_encode_cache"]
-
-        ctx = self._build_ar_chunk_ctx(
-            st=st,
-            text=text,
-            caches=caches,
-            rope=rope,
-            scheduler=scheduler,
-            gen=gen,
-            cond_mask_c0=cond_mask_c0,
-            cond_mask_zero=cond_mask_zero,
-            image_full=image_full,
-            inject_mask=inject_mask,
-            hdmap_zero=hdmap_zero,
-            cross_attn_kv=cross_attn_kv,
-            hdmap_encode_cache=hdmap_encode_cache,
-            hp=hp,
-            wp=wp,
-            len_t=len_t,
-            chunk_tokens=chunk_tokens,
-            in_d=in_d,
-            dit_dtype=dit_dtype,
-            device=device,
-            context_noise=context_noise,
-        )
+            ctx = self._build_ar_chunk_ctx(
+                st=st,
+                text=text,
+                caches=caches,
+                rope=rope,
+                scheduler=scheduler,
+                gen=gen,
+                cond_mask_c0=cond_mask_c0,
+                cond_mask_zero=cond_mask_zero,
+                image_full=image_full,
+                inject_mask=inject_mask,
+                hdmap_zero=hdmap_zero,
+                cross_attn_kv=cross_attn_kv,
+                hdmap_encode_cache=hdmap_encode_cache,
+                hp=hp,
+                wp=wp,
+                len_t=len_t,
+                chunk_tokens=chunk_tokens,
+                in_d=in_d,
+                dit_dtype=dit_dtype,
+                device=device,
+                context_noise=context_noise,
+            )
+            rc["ar_ctx"] = ctx
 
         # Per-chunk body is IDENTICAL to the offline loop body (lives in
         # ``_run_ar_chunk``); only the loop boundary + state persistence differ.
-        chunk_latent_btchw = self._run_ar_chunk(ctx, chunk_idx)
+        chunk_latent_btchw = self._run_ar_chunk(
+            ctx, chunk_idx, st.get("hdmap_pixel_chunk")
+        )
 
         # Advance the persistent chunk index for the next call.
         cache_state.chunk_idx += 1
