@@ -32,7 +32,6 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_omnidreams_flow_
     OmniDreamsFlowMatchScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams import (  # noqa: E501
-    _MAX_AR_CHUNKS,
     OmniDreamsBeforeDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.realtime.states import (
@@ -479,12 +478,4 @@ def test_compute_num_chunks_boundaries(num_frames, expected):
     batch = types.SimpleNamespace(num_frames=num_frames)
     assert (
         OmniDreamsBeforeDenoisingStage._compute_num_chunks(batch, len_t=2) == expected
-    )
-
-
-def test_compute_num_chunks_caps_ar_loop():
-    batch = types.SimpleNamespace(num_frames=10_000_000)
-    assert (
-        OmniDreamsBeforeDenoisingStage._compute_num_chunks(batch, len_t=2)
-        == _MAX_AR_CHUNKS
     )

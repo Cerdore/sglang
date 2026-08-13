@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import inspect
 import os
-from collections import OrderedDict
 from typing import Any
 
 import msgspec
@@ -90,13 +89,6 @@ _SYSTEM_PROMPT = (
     "You are a helpful assistant who will provide prompts to an image generator."
 )
 _TEXT_MAX_LENGTH = 512
-# Upper bound on autoregressive chunks per request. Bounds the rollout loop
-# length (and thus GPU memory/compute) against an unbounded ``num_frames`` from
-# the HTTP API. ~256 chunks * len_t(2) * 4 = ~2048 pixel frames.
-_MAX_AR_CHUNKS = 320
-# LRU cache for text embeddings (key = prompt string, value = [1, L, 100352] on CPU).
-# Avoids re-running the 14 GB Cosmos-Reason1-7B for repeated prompts in serving.
-_TEXT_EMBED_CACHE_MAX_SIZE = 32
 # HD-map inputs ending in one of these are decoded as a per-frame raster video;
 # any other single string is treated as one image (degenerate broadcast).
 _HDMAP_VIDEO_EXTS = (".mp4", ".gif", ".webm", ".mov", ".mkv", ".avi")
@@ -241,8 +233,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         self.image_encoder = image_encoder  # one-shot first-frame I2V conditioning
         self.encoder = encoder  # per-AR-step HDMap conditioning
         self.config = config
-        # Per-instance LRU cache: prompt string -> text embedding on CPU.
-        self._text_embed_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -287,13 +277,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         producing washed-out / blurry rollouts. Message format and ``add_vision_id``
         mirror FlashDreams exactly so the token sequence is identical.
         """
-        # LRU cache: skip the 14 GB encoder for repeated prompts (serving).
-        cached = self._text_embed_cache.get(prompt)
-        if cached is not None:
-            # Move to front (LRU hit); return pinned tensor on device.
-            self._text_embed_cache.move_to_end(prompt)
-            return cached.to(device=device, non_blocking=True)
-
         messages = [
             {"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]},
             {"role": "user", "content": [{"type": "text", "text": prompt}]},
@@ -330,10 +313,6 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             return_dict=True,
         )
         embeds = full_concat_embeddings(out.hidden_states)
-        # Store on CPU to avoid consuming GPU VRAM in the cache.
-        if len(self._text_embed_cache) >= _TEXT_EMBED_CACHE_MAX_SIZE:
-            self._text_embed_cache.popitem(last=False)
-        self._text_embed_cache[prompt] = embeds.detach().cpu()
         return embeds
 
     @staticmethod
@@ -951,23 +930,11 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         num_frames = int(getattr(batch, "num_frames", None) or 0)
         tc = 4
         if num_frames <= 0:
-            n = max(1, int(getattr(batch, "num_chunks", 1)))
-        else:
-            first = 1 + (len_t - 1) * tc
-            if num_frames <= first:
-                n = 1
-            else:
-                n = 1 + -(-(num_frames - first) // (len_t * tc))  # ceil division
-        if n > _MAX_AR_CHUNKS:
-            logger.warning(
-                "OmniDreams: requested %d AR chunks exceeds the cap %d; clamping "
-                "(num_frames=%d). Raise _MAX_AR_CHUNKS if longer rollouts are needed.",
-                n,
-                _MAX_AR_CHUNKS,
-                num_frames,
-            )
-            n = _MAX_AR_CHUNKS
-        return n
+            return max(1, int(getattr(batch, "num_chunks", 1)))
+        first = 1 + (len_t - 1) * tc
+        if num_frames <= first:
+            return 1
+        return 1 + -(-(num_frames - first) // (len_t * tc))  # ceil division
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -1065,6 +1032,34 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             )
         return uses
 
+    def _begin_ar_residency(self) -> tuple[Any, Any]:
+        """Hold the DiT (+ HD-map encoder) resident for the AR rollout.
+
+        No-op when the residency manager is absent (single-GPU / CPU test) or
+        the component is already resident. Returns the ``(transformer_use,
+        encoder_use)`` handles for :meth:`_end_ar_residency`.
+        """
+        residency_manager = self._component_residency_manager
+        transformer_use = None
+        encoder_use = None
+        if residency_manager is not None:
+            transformer_use = self._declared_component_use(component_name="transformer")
+            residency_manager.begin_use(transformer_use, self.transformer)
+            # The HD-map encoder VAE is per-chunk VAE-encoded in the AR loop
+            # (per-frame video path). Hold it resident alongside the DiT.
+            if self.encoder is not None:
+                encoder_use = self._declared_component_use(component_name="encoder")
+                residency_manager.begin_use(encoder_use, self.encoder)
+        return transformer_use, encoder_use
+
+    def _end_ar_residency(self, transformer_use, encoder_use) -> None:
+        """Release the DiT (+ HD-map encoder) held by :meth:`_begin_ar_residency`."""
+        residency_manager = self._component_residency_manager
+        if residency_manager is not None and transformer_use is not None:
+            residency_manager.end_use(transformer_use, self.transformer)
+        if residency_manager is not None and encoder_use is not None:
+            residency_manager.end_use(encoder_use, self.encoder)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # Phase 6 guard: TP is supported via column/row parallel layers in the
@@ -1111,17 +1106,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # single DiT resident afterwards; on the error path the request-level
         # finish_request still releases it, so an explicit try/finally is not
         # needed here.
-        residency_manager = self._component_residency_manager
-        transformer_use = None
-        encoder_use = None
-        if residency_manager is not None:
-            transformer_use = self._declared_component_use(component_name="transformer")
-            residency_manager.begin_use(transformer_use, self.transformer)
-            # The HD-map encoder VAE is per-chunk VAE-encoded in the AR loop
-            # (per-frame video path). Hold it resident alongside the DiT.
-            if self.encoder is not None:
-                encoder_use = self._declared_component_use(component_name="encoder")
-                residency_manager.begin_use(encoder_use, self.encoder)
+        transformer_use, encoder_use = self._begin_ar_residency()
 
         config = server_args.pipeline_config
         device = get_local_torch_device()
@@ -1271,10 +1256,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         _log_omnidreams_stats("ar_concat_latents", batch.latents)
 
-        if residency_manager is not None and transformer_use is not None:
-            residency_manager.end_use(transformer_use, self.transformer)
-        if residency_manager is not None and encoder_use is not None:
-            residency_manager.end_use(encoder_use, self.encoder)
+        self._end_ar_residency(transformer_use, encoder_use)
 
         return batch
 
@@ -1469,25 +1451,14 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         # Hold the DiT (and HD-map encoder, when present) resident for this
         # chunk's forward. Same pattern as the offline path.
-        residency_manager = self._component_residency_manager
-        transformer_use = None
-        encoder_use = None
-        if residency_manager is not None:
-            transformer_use = self._declared_component_use(component_name="transformer")
-            residency_manager.begin_use(transformer_use, self.transformer)
-            if self.encoder is not None:
-                encoder_use = self._declared_component_use(component_name="encoder")
-                residency_manager.begin_use(encoder_use, self.encoder)
+        transformer_use, encoder_use = self._begin_ar_residency()
 
         try:
             return self._realtime_denoise_chunk(
                 batch, server_args, device, dit_dtype
             )
         finally:
-            if residency_manager is not None and transformer_use is not None:
-                residency_manager.end_use(transformer_use, self.transformer)
-            if residency_manager is not None and encoder_use is not None:
-                residency_manager.end_use(encoder_use, self.encoder)
+            self._end_ar_residency(transformer_use, encoder_use)
 
     def _realtime_denoise_chunk(
         self,

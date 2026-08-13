@@ -80,38 +80,6 @@ def _len_t(server_args: ServerArgs) -> int:
         return 2
 
 
-def _window_size_t(server_args: ServerArgs) -> int:
-    """Return the KV-cache rolling window size (latent frames) from pipeline config."""
-    try:
-        return int(server_args.pipeline_config.dit_config.arch_config.window_size_t)
-    except AttributeError:
-        pass
-    try:
-        from sglang.multimodal_gen.configs.sample.omnidreams import (
-            OmniDreamsSamplingParams,
-        )
-
-        return OmniDreamsSamplingParams.window_size_t
-    except AttributeError:
-        return 6
-
-
-def _sink_size_t(server_args: ServerArgs) -> int:
-    """Return the KV-cache permanent sink size (latent frames) from pipeline config."""
-    try:
-        return int(server_args.pipeline_config.dit_config.arch_config.sink_size_t)
-    except AttributeError:
-        pass
-    try:
-        from sglang.multimodal_gen.configs.sample.omnidreams import (
-            OmniDreamsSamplingParams,
-        )
-
-        return OmniDreamsSamplingParams.sink_size_t
-    except AttributeError:
-        return 0
-
-
 def _get_num_frames(block_idx: int, len_t: int) -> int:
     """Return pixel frame count for the given AR chunk index.
 
@@ -255,13 +223,10 @@ class OmniDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
         Per-chunk HD-map raster providing the spatial driving condition for the
         denoising stage.  See :meth:`ingest_event` for the assumed encoding.
 
-    KV window
-    ---------
-    ``realtime_causal_kv_cache_num_frames`` ← ``window_size_t`` (default 6)
-    ``realtime_causal_sink_size``           ← ``sink_size_t``    (default 0)
-
-    Both are read from the pipeline config at runtime via :func:`_window_size_t`
-    and :func:`_sink_size_t`; request-level overrides (if present) take priority.
+    The KV-cache window/sink sizes are read by the denoise stage directly from
+    the pipeline config / ``OmniDreamsSamplingParams`` (not via the batch's
+    ``realtime_causal_kv_cache_*`` fields — those are a causal-DMD mechanism
+    OmniDreams does not use).
 
     Open-loop today: :meth:`wait_for_next_chunk` returns immediately; when the
     hdmap queue is empty the denoise stage falls back to repeating the last
@@ -445,17 +410,6 @@ class OmniDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
             batch.realtime_output_format = req.realtime_output_format
             batch.realtime_preview_max_width = req.realtime_preview_max_width
             batch.realtime_output_pacing = bool(req.realtime_output_pacing)
-            # KV window: prefer explicit request override, fall back to pipeline defaults.
-            batch.realtime_causal_kv_cache_num_frames = (
-                req.realtime_causal_kv_cache_num_frames
-                if req.realtime_causal_kv_cache_num_frames is not None
-                else _window_size_t(server_args)
-            )
-            batch.realtime_causal_sink_size = (
-                req.realtime_causal_sink_size
-                if req.realtime_causal_sink_size is not None
-                else _sink_size_t(server_args)
-            )
 
         return batch
 
