@@ -1147,6 +1147,8 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             self._maybe_load_weight_only_fp8(batch, server_args)
         elif mode == "fp8_compute":
             self._maybe_install_fp8_compute(config, device)
+        elif mode == "fp8_compute_prepared":
+            self._maybe_install_prepared_fp8_compute(config, device)
 
         # Persistent streaming VAE-encode cache for the per-frame HD-map path
         # (chunk 0 seeds the causal left-context, later chunks continue).
@@ -1509,6 +1511,8 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 self._maybe_load_weight_only_fp8(batch, server_args)
             elif mode == "fp8_compute":
                 self._maybe_install_fp8_compute(config, device)
+            elif mode == "fp8_compute_prepared":
+                self._maybe_install_prepared_fp8_compute(config, device)
 
             ctx = self._build_ar_chunk_ctx(
                 st=st,
@@ -1626,6 +1630,33 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             logger.info(
                 "OmniDreams: fp8_compute requested but unavailable; eager bf16."
             )
+
+    def _maybe_install_prepared_fp8_compute(self, config, device) -> None:
+        """Install FP8 GEMMs from the explicit offline artifact, or fail loudly."""
+        if getattr(self.transformer, "_fp8_compute_applied", False):
+            return
+        fp8_prepared_path = getattr(config, "native_dit_fp8_prepared_path", None)
+        if not fp8_prepared_path:
+            raise ValueError(
+                "fp8_compute_prepared requires native_dit_fp8_prepared_path"
+            )
+        if not os.path.isfile(fp8_prepared_path):
+            raise FileNotFoundError(
+                f"prepared FP8 DiT artifact not found: {fp8_prepared_path}"
+            )
+        payload = torch.load(fp8_prepared_path, map_location="cpu", weights_only=True)
+        weights = payload.get("weights")
+        if not isinstance(weights, dict):
+            raise ValueError("prepared FP8 DiT artifact has no 'weights' dictionary")
+        from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+            install_fp8_compute_on_dit,
+        )
+
+        if not install_fp8_compute_on_dit(self.transformer, prepared_weights=weights):
+            raise RuntimeError(
+                f"fp8_compute_prepared is unavailable on device {device}; refusing BF16 fallback"
+            )
+        logger.info("OmniDreams: fp8_compute_prepared active from %s.", fp8_prepared_path)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

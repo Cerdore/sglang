@@ -39,6 +39,17 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 
+# SageAttention-3 FP4/FP8 kernel (the same kernel FlashDreams uses), built for
+# sm_120a. On non-Blackwell hosts / when sageattn3 is not built it stays None and
+# self-attention falls back to SDPA. (Same import-guard pattern as
+# runtime/platforms/cuda.py's SAGE_ATTN_3 resolver.)
+_sageattn3_blackwell = None
+if torch.cuda.is_available():
+    try:
+        from sageattn3 import sageattn3_blackwell as _sageattn3_blackwell
+    except Exception:  # pragma: no cover - sageattn3 is a from-source Blackwell ext
+        _sageattn3_blackwell = None
+
 
 def _sp_size() -> int:
     try:
@@ -332,7 +343,13 @@ class OmniDreamsAttention(nn.Module):
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q_t, k_t, v_t)
+        if _sageattn3_blackwell is not None:
+            # SageAttention-3 FP4/FP8 kernel ([B,H,S,D]). OmniDreams self-attn is
+            # always MHA (Hq == Hkv), so the fast path applies. is_causal=False:
+            # cross-chunk causality comes from the KV window, not a mask.
+            out = _sageattn3_blackwell(q_t, k_t, v_t, is_causal=False)
+        else:
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t)
         out = out.transpose(1, 2).reshape(B, L, n * d)
         out, _ = self.output_proj(out)
         return out
@@ -744,8 +761,10 @@ class OmniDreamsDiT(BaseDiT):
         )
         # A single chunk's forward is compile-safe under fullgraph=False: the
         # only dynamic ops here are the per-block KV read/write, which graph-break
-        # cleanly. torch.compile must use max-autotune-no-cudagraphs so inductor
-        # does not install CUDA graphs that collide with OmniDreamsCUDAGraphRunner.
+        # cleanly. When torch.compile is combined with the breakable CUDA graph
+        # (BCG), run torch.compile with max-autotune-no-cudagraphs so inductor
+        # does not install its own CUDA graphs that conflict with BCG. (The old
+        # OmniDreamsCUDAGraphRunner this originally referenced was removed.)
         if self._sp_size > 1:
             raise RuntimeError(
                 "Sequence parallelism (SP) is not yet supported for OmniDreams. "

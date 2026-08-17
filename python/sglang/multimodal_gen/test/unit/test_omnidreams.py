@@ -315,7 +315,7 @@ def _hdmap_stage(monkeypatch):
 def test_encode_hdmap_per_frame_clip_slicing(monkeypatch):
     """Per-frame HD-map (option 2): the full raster sequence is decoded once as a
     causal clip (deferred per-chunk VAE encode in the AR loop). Returns
-    ``(None, clip)`` where ``clip`` has ``num_chunks * len_t`` latent frames."""
+    ``clip`` where the temporal length covers ``num_chunks * len_t`` latent frames."""
     stage = _hdmap_stage(monkeypatch)
     dev = torch.device("cpu")
     num_chunks, len_t = 3, 2
@@ -323,11 +323,8 @@ def test_encode_hdmap_per_frame_clip_slicing(monkeypatch):
     total_pixel = 1 + (num_latent - 1) * 4  # 21
 
     b = types.SimpleNamespace(hdmap_path=list(range(total_pixel)), hdmap_pixels=None)
-    toks, pixel = stage._encode_hdmap(
-        b, dev, torch.float32, torch.float32, num_chunks, len_t, 16, 16
-    )
-    # Per-frame path defers VAE encode to the AR loop -> (None, clip).
-    assert toks is None
+    pixel = stage._encode_hdmap(b, dev, torch.float32, num_chunks, len_t, 16, 16)
+    # Per-frame path defers VAE encode to the AR loop and returns its pixel clip.
     assert pixel is not None
     # pixel shape: [B, 3, total_pixel, H, W]
     assert pixel.shape[2] == total_pixel
@@ -412,12 +409,81 @@ def test_prepare_fp8_dit_weights_unfuses_to_qkv_into_qkv_proj():
         assert torch.allclose(deq[:inner], orig[:inner], atol=1.0)
 
 
+def test_prepared_fp8_weight_cache_uses_artifact_bytes_and_tp_row_shard():
+    """Prepared FP8 compute must consume artifact bytes, never BF16-dequantize."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+        prepared_fp8_weight_cache,
+    )
+
+    raw = torch.arange(24, dtype=torch.uint8).reshape(6, 4)
+    scale = torch.arange(1, 7, dtype=torch.float16)
+    fp8, fp8_scale = prepared_fp8_weight_cache(
+        {"blocks.0.self_attn.qkv_proj.weight": raw,
+         "blocks.0.self_attn.qkv_proj.weight_scale": scale},
+        "blocks.0.self_attn.qkv_proj.weight",
+        target_shape=(3, 4),
+        tp_rank=1,
+        tp_world_size=2,
+    )
+
+    assert fp8.dtype is torch.float8_e4m3fn
+    assert torch.equal(fp8.view(torch.uint8), raw[3:])
+    assert fp8_scale.dtype is torch.float32
+    assert torch.equal(fp8_scale, scale[3:].float().reshape(1, -1))
+
+
+def test_prepared_fp8_keeps_cross_attention_kv_in_bf16():
+    """Cross-attention K/V must retain BF16 precision for conditioning fidelity."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+        prepare_fp8_dit_weights,
+    )
+
+    key = "blocks.0.cross_attn.to_kv.weight"
+    weight = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.bfloat16)
+    cosmos_utils = types.SimpleNamespace(
+        prepare_cosmos_quantized_streaming_weights=lambda *args, **kwargs: {
+            key: weight
+        }
+    )
+
+    prepared = prepare_fp8_dit_weights(
+        {}, num_blocks=1, cosmos_fp8_utils=cosmos_utils
+    )
+
+    assert prepared[key].dtype is torch.bfloat16
+    assert key + "_scale" not in prepared
+
+
+@requires_gpu
+@torch.no_grad()
+def test_fp8_compute_keeps_attention_bf16_and_quantizes_mlp_only():
+    """The safe compute policy must not FP8-quantize attention projections."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+        OmniDreamsFP8ComputeLinear,
+        install_fp8_compute_on_dit,
+    )
+
+    model = _tiny_dit()
+    original_qkv_method = model.blocks[0].self_attn.to_qkv.quant_method
+
+    assert install_fp8_compute_on_dit(model)
+
+    assert model.blocks[0].self_attn.to_qkv.quant_method is original_qkv_method
+    assert isinstance(model.blocks[0].mlp.layer1, OmniDreamsFP8ComputeLinear)
+    assert isinstance(model.blocks[0].mlp.layer2, OmniDreamsFP8ComputeLinear)
+
+
 # --------------------------------------------------------------------------- #
 # Config three-state validation.                                              #
 # --------------------------------------------------------------------------- #
-def test_config_three_state_valid():
-    """Phase 1+2: native_dit_acceleration accepts disabled/weight_only_fp8/fp8_compute."""
-    for mode in ("disabled", "weight_only_fp8", "fp8_compute"):
+def test_config_fp8_acceleration_modes_valid():
+    """The explicit prepared mode is accepted alongside existing FP8 modes."""
+    for mode in (
+        "disabled",
+        "weight_only_fp8",
+        "fp8_compute",
+        "fp8_compute_prepared",
+    ):
         cfg = OmniDreamsPipelineConfig(native_dit_acceleration=mode)
         assert cfg.native_dit_acceleration == mode
 

@@ -34,11 +34,16 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import set_default_torch_dty
 # from it, so placing the type there would create a circular import).       #
 # --------------------------------------------------------------------------- #
 NativeAccelerationMode = Literal[
-    "disabled", "weight_only_fp8", "fp8_compute", "auto", "required"
+    "disabled", "weight_only_fp8", "fp8_compute", "fp8_compute_prepared", "auto", "required"
 ]
 """Native DiT acceleration policy (see normalize_native_acceleration_mode)."""
 
-_VALID_NATIVE_MODES: tuple[str, ...] = ("disabled", "weight_only_fp8", "fp8_compute")
+_VALID_NATIVE_MODES: tuple[str, ...] = (
+    "disabled",
+    "weight_only_fp8",
+    "fp8_compute",
+    "fp8_compute_prepared",
+)
 _NATIVE_MODE_ALIASES: dict[str, str] = {
     "auto": "disabled",
     "required": "weight_only_fp8",
