@@ -126,9 +126,12 @@ class Parallel:
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
-            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
-            choices=["ag_rs", "a2a", "fi_a2a"],
+            "combine), 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72), or 'symm_a2a' "
+            "(direct PyTorch symmetric-memory peer-to-peer exchange of "
+            "output+LSE + fused CUDA LSE combine; requires a single-node "
+            "CUDA group with full NVLink/NVSwitch connectivity).",
+            choices=["ag_rs", "a2a", "fi_a2a", "symm_a2a"],
             resolvable=True,
         ),
     ] = "ag_rs"

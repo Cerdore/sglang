@@ -310,7 +310,7 @@ class BaseRunner(ABC):
         """Allocate direct DCP A2A symmetric memory before graph capture."""
         mr = self.model_runner
         parallel = get_parallel()
-        if mr.server_args.dcp_size <= 1 or parallel.dcp_comm_backend != "symm_a2a":
+        if not parallel.dcp_enabled or parallel.dcp_comm_backend != "symm_a2a":
             return
 
         from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
