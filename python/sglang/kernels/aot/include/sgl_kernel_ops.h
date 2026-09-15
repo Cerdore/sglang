@@ -111,6 +111,18 @@ void direct_dcp_a2a_lse_reduce(
     int64_t rank,
     int64_t max_num_tokens,
     bool is_lse_base_on_e);
+void direct_dcp_q_gather(
+    const at::Tensor& local_query,
+    at::Tensor& final_query,
+    at::Tensor& received_signal,
+    at::Tensor& completion,
+    at::Tensor& epoch,
+    int64_t world_size,
+    int64_t rank,
+    int64_t max_num_tokens,
+    int64_t padded_num_heads,
+    int64_t query_mc_ptr,
+    int64_t signal_mc_ptr);
 void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope,

@@ -33,6 +33,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_triton_kv_indices_for_dcp_triton,
 )
 from sglang.srt.layers.dcp.comm import (
+    DirectDCPQGatherWorkspace,
     DirectSymmA2AWorkspace,
     all_gather_kv_cache_for_dcp,
     all_gather_kv_cache_for_mha_chunk_extend,
@@ -43,9 +44,12 @@ from sglang.srt.layers.dcp.comm import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
     dcp_enabled,
+    estimate_dcp_qgather_workspace_nbytes,
     estimate_symm_a2a_workspace_nbytes,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
+    get_dcp_q_gather_workspace,
+    init_dcp_q_gather_workspace,
     init_fi_a2a_workspace,
     init_symm_a2a_workspace,
 )
@@ -66,8 +70,10 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 __all__ = [
     "DecodeContextParallelMetadata",
+    "DirectDCPQGatherWorkspace",
     "DirectSymmA2AWorkspace",
     "dcp_a2a_lse_reduce",
+    "estimate_dcp_qgather_workspace_nbytes",
     "estimate_symm_a2a_workspace_nbytes",
     "init_fi_a2a_workspace",
     "init_symm_a2a_workspace",
@@ -84,5 +90,7 @@ __all__ = [
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
     "get_dcp_lens",
+    "get_dcp_q_gather_workspace",
+    "init_dcp_q_gather_workspace",
     "update_local_kv_lens_for_dcp",
 ]

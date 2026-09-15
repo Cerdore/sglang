@@ -50,6 +50,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "-> ()");
   m.impl("direct_dcp_a2a_lse_reduce", torch::kCUDA, &direct_dcp_a2a_lse_reduce);
   m.def(
+      "direct_dcp_q_gather(Tensor local_query, Tensor! final_query, Tensor! received_signal, "
+      "Tensor! completion, Tensor! epoch, int world_size, int rank, int max_num_tokens, "
+      "int padded_num_heads, int query_mc_ptr, int signal_mc_ptr) -> ()");
+  m.impl("direct_dcp_q_gather", torch::kCUDA, &direct_dcp_q_gather);
+  m.def(
       "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);

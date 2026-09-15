@@ -811,6 +811,237 @@ def init_symm_a2a_workspace(
     return workspace
 
 
+_DCP_QGATHER_WORKSPACE_KEY = "dcp_qgather_workspace"
+
+
+def estimate_dcp_qgather_workspace_nbytes(
+    max_num_tokens: int,
+    world_size: int,
+    heads_per_rank: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> int:
+    """Bytes one rank needs for the symmetric direct q-gather slab.
+
+    Layout (16-byte aligned regions in one symmetric allocation):
+      [0, query_nbytes)            final_query [max_tokens, world_size*H, D]
+      [signal_offset, +signal_nbytes)  received_signal [2, world_size] int32
+    """
+    query_nbytes = _shape_nbytes(
+        (max_num_tokens, world_size * heads_per_rank, head_dim), dtype
+    )
+    signal_offset = _align16(query_nbytes)
+    signal_nbytes = _shape_nbytes((2, world_size), torch.int32)
+    return signal_offset + _align16(signal_nbytes)
+
+
+class DirectDCPQGatherWorkspace:
+    """Persistent symmetric-memory workspace for the direct DCP q-gather
+    (sglang port of vLLM #50484). Each rank multicast-writes its local query
+    head-slice into every peer's final query buffer via NVLS ``multimem.st``.
+
+    Unlike the symm_a2a *output* workspace, this does not need per-peer views:
+    the multicast write reaches every replica in one instruction. The local
+    ``final_query`` IS the gathered query once the kernel returns.
+    """
+
+    def __init__(
+        self,
+        cp_group: "GroupCoordinator",
+        device: torch.device,
+        max_num_tokens: int,
+        heads_per_rank: int,
+        head_dim: int,
+        dtype: torch.dtype,
+    ):
+        if cp_group.world_size <= 1:
+            raise ValueError("DirectDCPQGatherWorkspace requires dcp world_size > 1")
+        if max_num_tokens <= 0:
+            raise ValueError("max_num_tokens must be greater than 0")
+        if heads_per_rank <= 0 or head_dim <= 0:
+            raise ValueError("heads_per_rank and head_dim must be greater than 0")
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("dtype must be torch.float16 or torch.bfloat16")
+
+        self.cp_group = cp_group
+        self.device = torch.device(device)
+        self.world_size = cp_group.world_size
+        self.rank = cp_group.rank_in_group
+        self.max_num_tokens = max_num_tokens
+        self.heads_per_rank = heads_per_rank
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.gathered_heads = self.world_size * heads_per_rank
+
+        query_nbytes = _shape_nbytes(
+            (max_num_tokens, self.gathered_heads, head_dim), dtype
+        )
+        self._signal_offset = _align16(query_nbytes)
+        signal_nbytes = _shape_nbytes((2, self.world_size), torch.int32)
+        slab_nbytes = self._signal_offset + _align16(signal_nbytes)
+
+        storage, handle = self._allocate_slab(slab_nbytes)
+        self._allocation = (storage, handle)
+
+        self.final_query = storage[0:query_nbytes].view(dtype).view(
+            max_num_tokens, self.gathered_heads, head_dim
+        )
+        self.received_signal = storage[
+            self._signal_offset : self._signal_offset + signal_nbytes
+        ].view(torch.int32).view(2, self.world_size)
+
+        mc_base = int(handle.multicast_ptr)
+        self.has_multicast = mc_base != 0
+        self.query_mc_ptr = mc_base
+        self.signal_mc_ptr = (
+            mc_base + self._signal_offset if self.has_multicast else 0
+        )
+
+        self.epoch = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self.completion = torch.zeros(1, dtype=torch.int32, device=self.device)
+
+    @property
+    def geometry(self):
+        return (
+            self.cp_group.device_group.group_name,
+            self.cp_group.cpu_group.group_name,
+            self.world_size,
+            self.rank,
+            self.device,
+            self.max_num_tokens,
+            self.heads_per_rank,
+            self.head_dim,
+            self.dtype,
+        )
+
+    def _allocate_slab(self, total_bytes: int):
+        """Allocate one symmetric slab and confirm the mapping group-wide.
+
+        Trimmed from DirectSymmA2AWorkspace._allocate_slab: q-gather uses
+        multicast, so it needs the handle (for ``multicast_ptr``) but not
+        per-peer views. The group-wide CPU status check is kept so a rank that
+        fails mapping does not leave peers blocked at a later barrier.
+        """
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            _allocate_symmetric_memory,
+        )
+
+        local_error: Optional[Exception] = None
+        storage = handle = None
+        try:
+            storage, handle = _allocate_symmetric_memory(
+                total_bytes,
+                device=self.device,
+                group=self.cp_group.cpu_group,
+            )
+            storage.zero_()
+            torch.cuda.synchronize(self.device)
+        except Exception as error:
+            local_error = error
+
+        local_success = storage is not None and handle is not None
+        status = torch.tensor(
+            [int(local_success)],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        torch.distributed.all_reduce(
+            status,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.cp_group.cpu_group,
+        )
+        if not status.item():
+            raise RuntimeError(
+                "DCP q-gather symmetric-memory allocation or mapping failed on "
+                "at least one DCP rank; the NVLS multicast path is unavailable "
+                "-- use --dcp-direct-q-gather=off to fall back to NCCL."
+            ) from local_error
+        return storage, handle
+
+    def gather(self, local_query: torch.Tensor) -> torch.Tensor:
+        """Multicast this rank's local query head-slice to every peer's final
+        query buffer and return the local gathered query [T, gathered_heads, D].
+        """
+        from sgl_kernel import direct_dcp_q_gather
+
+        num_tokens = local_query.size(0)
+        if num_tokens > self.max_num_tokens:
+            raise ValueError(
+                f"num_tokens {num_tokens} exceeds max_num_tokens "
+                f"{self.max_num_tokens}"
+            )
+        if not self.has_multicast:
+            raise RuntimeError(
+                "DirectDCPQGatherWorkspace.gather called without a multicast "
+                "pointer; caller must route to the NCCL fallback instead."
+            )
+        direct_dcp_q_gather(
+            local_query,
+            self.final_query[:num_tokens],
+            self.received_signal,
+            self.completion,
+            self.epoch,
+            self.world_size,
+            self.rank,
+            self.max_num_tokens,
+            self.gathered_heads,
+            self.query_mc_ptr,
+            self.signal_mc_ptr,
+        )
+        return self.final_query[:num_tokens]
+
+
+def init_dcp_q_gather_workspace(
+    cp_group: "GroupCoordinator",
+    device: torch.device,
+    max_num_tokens: int,
+    heads_per_rank: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> Optional[DirectDCPQGatherWorkspace]:
+    """Allocate the direct q-gather workspace before CUDA-graph capture.
+
+    Returns ``None`` if NVLS multicast is unavailable on this topology; the
+    caller then routes Q through the NCCL AllGather fallback.
+    """
+    if cp_group.world_size == 1:
+        return None
+
+    requested_geometry = (
+        cp_group.device_group.group_name,
+        cp_group.cpu_group.group_name,
+        cp_group.world_size,
+        cp_group.rank_in_group,
+        torch.device(device),
+        max_num_tokens,
+        heads_per_rank,
+        head_dim,
+        dtype,
+    )
+    workspace = get_buffer(
+        _DCP_QGATHER_WORKSPACE_KEY,
+        lambda: DirectDCPQGatherWorkspace(
+            cp_group=cp_group,
+            device=device,
+            max_num_tokens=max_num_tokens,
+            heads_per_rank=heads_per_rank,
+            head_dim=head_dim,
+            dtype=dtype,
+        ),
+    )
+    if workspace.geometry != requested_geometry:
+        raise RuntimeError(
+            "dcp q-gather workspace geometry changed during initialization"
+        )
+    return workspace
+
+
+def get_dcp_q_gather_workspace() -> Optional[DirectDCPQGatherWorkspace]:
+    """Return the process-wide direct q-gather workspace, or ``None`` if it was
+    not initialized (no symm_a2a backend, or NVLS multicast unavailable)."""
+    return get_context().resources.buffers.get(_DCP_QGATHER_WORKSPACE_KEY)
+
+
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
     # the stream and barriers cross-rank, neither of which is capturable.

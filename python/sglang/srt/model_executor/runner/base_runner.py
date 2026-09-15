@@ -244,6 +244,7 @@ class BaseRunner(ABC):
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
         self._pre_initialize_symm_a2a_workspace()
+        self._pre_initialize_dcp_q_gather_workspace()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -367,6 +368,82 @@ class BaseRunner(ABC):
             dtype=mr.dtype,
             num_ubatches=num_ubatches,
         )
+
+    def _pre_initialize_dcp_q_gather_workspace(self):
+        """Allocate the direct q-gather symmetric-memory workspace before graph
+        capture (sglang port of vLLM #50484). Only initialized for the
+        symm_a2a backend; the workspace records whether NVLS multicast is
+        available, and the forward path falls back to NCCL AllGather if not.
+        """
+        mr = self.model_runner
+        parallel = get_parallel()
+        if (
+            not parallel.dcp_enabled
+            or parallel.dcp_comm_backend != "symm_a2a"
+        ):
+            return
+
+        from sglang.srt.layers.dcp import (
+            estimate_dcp_qgather_workspace_nbytes,
+            init_dcp_q_gather_workspace,
+        )
+
+        cp_group = parallel.dcp_group
+        device = torch.device(f"cuda:{mr.gpu_id}")
+        kv_lora_rank = getattr(mr.model_config, "kv_lora_rank", None)
+        qk_rope_head_dim = getattr(mr.model_config, "qk_rope_head_dim", None)
+        if kv_lora_rank is None or qk_rope_head_dim is None:
+            # Not an MLA model with the packed Q dims the kernel expects; leave
+            # the workspace un-initialized so the forward path uses NCCL.
+            return
+        # Packed Q: q_nope (kv_lora_rank, absorbed) + q_pe (qk_rope_head_dim).
+        head_dim = kv_lora_rank + qk_rope_head_dim
+        heads_per_rank = mr.model_config.get_num_attention_heads(parallel.attn_tp_size)
+        max_num_tokens = max(
+            self._eager_max_bs * self._eager_num_tokens_per_req,
+            mr.max_decode_logits_rows(),
+        )
+
+        workspace_bytes = estimate_dcp_qgather_workspace_nbytes(
+            max_num_tokens=max_num_tokens,
+            world_size=cp_group.world_size,
+            heads_per_rank=heads_per_rank,
+            head_dim=head_dim,
+            dtype=mr.dtype,
+        )
+        if workspace_bytes > 256 * 1024**2:
+            logger.warning(
+                "dcp q-gather workspace estimate is %.1f MiB (over 256 MiB)",
+                workspace_bytes / 1024**2,
+            )
+
+        try:
+            workspace = init_dcp_q_gather_workspace(
+                cp_group,
+                device=device,
+                max_num_tokens=max_num_tokens,
+                heads_per_rank=heads_per_rank,
+                head_dim=head_dim,
+                dtype=mr.dtype,
+            )
+        except RuntimeError:
+            # NVLS multicast unavailable on this topology. Fall back to NCCL
+            # AllGather; the forward path sees no workspace and routes Q there.
+            logger.warning(
+                "dcp q-gather workspace unavailable (no NVLS multicast); "
+                "falling back to NCCL Q AllGather"
+            )
+            return
+        if workspace is not None and not workspace.has_multicast:
+            logger.warning(
+                "dcp q-gather: symmetric memory has no multicast pointer; "
+                "falling back to NCCL Q AllGather"
+            )
+        elif workspace is not None and workspace.has_multicast:
+            logger.info(
+                "dcp q-gather enabled: NVLS multicast available, "
+                "replacing per-layer NCCL Q AllGather"
+            )
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.

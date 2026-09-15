@@ -635,10 +635,27 @@ class DeepseekMLAForwardMixin:
         if get_parallel().dcp_enabled:
             if is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
-                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
-                        q_nope_out=q_nope_out,
-                        q_pe=q_pe,
-                    )
+                    # Direct NVLS multicast q-gather (sglang port of vLLM #50484):
+                    # each rank multicast-writes its local Q head-slice into every
+                    # peer's final buffer via ``multimem.st``, replacing the per-
+                    # layer NCCL AllGather. Gated on NVLS multicast availability;
+                    # falls back to the NCCL path otherwise (e.g. A100, no NVSwitch).
+                    from sglang.srt.layers.dcp import get_dcp_q_gather_workspace
+
+                    qg_workspace = get_dcp_q_gather_workspace()
+                    if qg_workspace is not None and qg_workspace.has_multicast:
+                        d_pe = q_pe.size(-1)
+                        d_nope = q_nope_out.size(-1)
+                        combined = torch.cat([q_pe, q_nope_out], dim=-1)
+                        gathered = qg_workspace.gather(combined)
+                        q_pe, q_nope_out = gathered.split(
+                            [d_pe, d_nope], dim=-1
+                        )
+                    else:
+                        q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                            q_nope_out=q_nope_out,
+                            q_pe=q_pe,
+                        )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(

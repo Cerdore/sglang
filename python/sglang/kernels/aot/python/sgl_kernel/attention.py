@@ -54,6 +54,43 @@ def direct_dcp_a2a_lse_reduce(
     return combined_output
 
 
+def direct_dcp_q_gather(
+    local_query: torch.Tensor,
+    final_query: torch.Tensor,
+    received_signal: torch.Tensor,
+    completion: torch.Tensor,
+    epoch: torch.Tensor,
+    world_size: int,
+    rank: int,
+    max_num_tokens: int,
+    padded_num_heads: int,
+    query_mc_ptr: int,
+    signal_mc_ptr: int,
+) -> None:
+    """Multicast each rank's local query head-slice into every consumer's final
+    query buffer via NVLS ``multimem.st`` (sglang port of vLLM #50484). After the
+    gather, every rank's ``final_query`` holds the fully-gathered query
+    ``[T, world_size * H_per_rank, D]`` -- no NCCL AllGather needed.
+
+    Requires SM90+ and an NVSwitch fabric. The workspace gates on
+    ``symm_mem.multicast_ptr != 0`` and the caller falls back to the NCCL path
+    otherwise.
+    """
+    torch.ops.sgl_kernel.direct_dcp_q_gather.default(
+        local_query,
+        final_query,
+        received_signal,
+        completion,
+        epoch,
+        world_size,
+        rank,
+        max_num_tokens,
+        padded_num_heads,
+        query_mc_ptr,
+        signal_mc_ptr,
+    )
+
+
 def merge_state_v2(
     v_a: torch.Tensor,
     s_a: torch.Tensor,
