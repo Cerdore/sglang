@@ -174,6 +174,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
+    init_nccl_ep_dispatchers,
     prebuild_deepep_v2_buffer,
     prepare_moe_topk,
 )
@@ -1101,32 +1102,7 @@ class ModelRunner:
         )
 
     def init_nccl_ep_comm_resources(self):
-        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-        if not get_moe_a2a_backend().is_nccl_ep():
-            return
-
-        layer_model = self.model
-        if not hasattr(layer_model, "layers"):
-            return
-        for layer in layer_model.layers:
-            moe_block = None
-            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-                moe_block = layer.mlp.experts
-            elif hasattr(layer, "block_sparse_moe") and hasattr(
-                layer.block_sparse_moe, "experts"
-            ):
-                moe_block = layer.block_sparse_moe.experts
-            elif hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
-                moe_block = layer.moe.experts
-            elif hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
-                moe_block = layer.mixer.experts
-            if moe_block is not None and hasattr(moe_block, "dispatcher"):
-                dispatcher = moe_block.dispatcher
-                if isinstance(dispatcher, NcclEpDispatcher):
-                    dispatcher.init_comm_resources()
-                    dispatcher.init_handle_for_graph()
+        init_nccl_ep_dispatchers(model=self.model)
 
     def post_capture_resize_kv_pool(self, *, draft_runners=()):
         resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)

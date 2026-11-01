@@ -385,10 +385,8 @@ class TestNcclEpDispatcherEpGroupType(unittest.TestCase):
                 "sglang.srt.layers.moe.fused_moe_triton.layer.get_tp_group",
                 return_value=tp_group_mock,
             ):
-                # Expert-major intentionally retains its legacy dispatcher;
-                # rank-major selects the new dispatcher at runtime.
                 with patch(
-                    "sglang.srt.layers.moe.token_dispatcher.nccl_ep_expert_major_legacy.NcclEpDispatcher"
+                    "sglang.srt.layers.moe.token_dispatcher.nccl_ep.NcclEpDispatcher"
                 ) as mock_disp_class:
                     create_moe_dispatcher(cfg)
 
@@ -436,7 +434,7 @@ class TestNcclRuntimeVersionParsing(unittest.TestCase):
                 self.assertEqual(result, (2, 30, 7))
 
     def test_falls_back_to_torch_version(self):
-        """When nccl4py returns unparseable data, fall back to torch.cuda.nccl.version."""
+        """When nccl4py returns unparsable data, fall back to torch.cuda.nccl.version."""
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
             _nccl_runtime_version,
         )

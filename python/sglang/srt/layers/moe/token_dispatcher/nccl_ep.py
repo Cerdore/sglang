@@ -205,10 +205,19 @@ def _nccl_runtime_version():
     return None
 
 
+def _nccl_ep_importable() -> bool:
+    # find_spec("nccl.ep") raises ModuleNotFoundError when the parent package is
+    # absent, which would escape the capability fallback.
+    try:
+        return importlib.util.find_spec("nccl.ep") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
 def nccl_ep_unavailable_reason() -> str | None:
     """Return why NCCL EP is unavailable (None = available), for fallback logs."""
-    if importlib.util.find_spec("nccl.ep") is None:
-        return "nccl4py (nccl.ep) not importable"
+    if not _nccl_ep_importable():
+        return "nccl-extensions (nccl.ep) not importable"
     if not torch.cuda.is_available():
         return "no CUDA device"
     cc = torch.cuda.get_device_capability(0)[0]  # Hopper (sm_90) or Blackwell.
@@ -223,7 +232,7 @@ def nccl_ep_unavailable_reason() -> str | None:
 
 
 def is_nccl_ep_available() -> bool:
-    """Whether nccl4py + NCCL >= 2.29 + Hopper/Blackwell are usable here."""
+    """Whether nccl-extensions + NCCL >= 2.29 + Hopper/Blackwell are usable here."""
     return nccl_ep_unavailable_reason() is None
 
 
@@ -569,9 +578,11 @@ class NcclEpDispatcher(BaseDispatcher):
         budget = get_nccl_ep_num_max_dispatch_tokens_per_rank()
         if budget <= 0:
             budget = _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK
-        assert budget <= _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP, (
-            f"NCCL EP max_dispatch_tokens_per_rank {budget} exceeds cap {_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP}"
-        )
+        if budget > _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP:
+            raise ValueError(
+                f"NCCL EP max_dispatch_tokens_per_rank {budget} exceeds the "
+                f"cap {_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP}"
+            )
         self.num_max_dispatch_tokens_per_rank = budget
 
         # Validate LL hard constraints early (fail fast at init, not at first dispatch).
@@ -596,6 +607,12 @@ class NcclEpDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
         self._dispatch_intermediate_state = None
         self._combine_intermediate_state = None
+        # A send_only call keeps the descriptor structs it was given until
+        # complete() runs, so these wrappers must outlive dispatch_a/combine_a.
+        self._dispatch_link_state = None
+        self._combine_link_state = None
+        # The handle copies the routing descriptor, not the tensor behind it.
+        self._dispatched_topk_ids = None
 
         # SBO dispatch hook: deepseek_v2.py registers a hook via
         # register_deepep_dispatch_hook to run shared experts between
@@ -677,13 +694,16 @@ class NcclEpDispatcher(BaseDispatcher):
         nccl_ep = self._nccl_ep
         topk_weights = topk_output.topk_weights.to(torch.float32)
         topk_ids = topk_output.topk_ids.to(torch.int64)
+        self._dispatched_topk_ids = topk_ids
 
         t = hidden_states.shape[0]
         if t > self.num_max_dispatch_tokens_per_rank:
             raise ValueError(
-                f"NCCL EP: decode batch ({t}) exceeds per-rank dispatch budget "
-                f"{self.num_max_dispatch_tokens_per_rank}; increase "
-                f"--nccl-ep-num-max-dispatch-tokens-per-rank or reduce batch."
+                f"NCCL EP: {t} tokens on one rank exceeds the per-rank dispatch "
+                f"capacity {self.num_max_dispatch_tokens_per_rank}. Lower "
+                f"--chunked-prefill-size / --max-prefill-tokens (prefill) or "
+                f"--cuda-graph-max-bs-decode (decode); the capacity cannot exceed "
+                f"{_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP} on this backend."
             )
 
         if self.handle is not None and not self._handle_persistent:
@@ -744,6 +764,7 @@ class NcclEpDispatcher(BaseDispatcher):
             stream=stream.cuda_stream,
         )
 
+        self._dispatch_link_state = (inputs, outputs, layout_info)
         self._dispatch_intermediate_state = (
             recv_tokens,
             expert_counters,
@@ -787,6 +808,7 @@ class NcclEpDispatcher(BaseDispatcher):
             config=nccl_ep.DispatchConfig(send_only=1),
             stream=stream.cuda_stream,
         )
+        self._dispatch_link_state = (inputs, outputs, layout_info)
         self._dispatch_intermediate_state = (
             recv_tokens,
             recv_ids,
@@ -813,7 +835,11 @@ class NcclEpDispatcher(BaseDispatcher):
 
         stream = torch.cuda.current_stream()
         self.handle.complete(config=0, stream=stream.cuda_stream)
+        self._dispatch_link_state = None
 
+        # TODO(nccl_ep): let NCCL quantize on the wire with
+        # DispatchQuantizationRecipe.DS_FP8E4M3 (hidden % 512 == 0 holds for every
+        # supported size) and drop this post-receive quantization pass.
         hs_fp8, hs_scale = self._quantize_fp8(recv_tokens, expert_counters)
 
         expected_m = (
@@ -841,15 +867,12 @@ class NcclEpDispatcher(BaseDispatcher):
 
         stream = torch.cuda.current_stream()
         self.handle.complete(config=0, stream=stream.cuda_stream)
+        self._dispatch_link_state = None
 
-        # A source rank cannot contribute more slots than its local input
-        # token count ``t``. NCCL lays each source rank's valid receive slots
-        # contiguously, so trim the fixed D capacity to [world, t] before the
-        # MoE preprocess. This avoids scanning world*D*topk metadata during
-        # low-concurrency decode without a dynamic-size GPU->CPU sync.
-        compact_width = t
-        if compact_width > recv_tokens.shape[1]:
-            raise ValueError("rank-major receive count exceeds the slot capacity")
+        # Per-source-rank valid slots are `src_rank_counters` (masked below);
+        # a remote rank's contribution is bounded by ITS batch, not this rank's
+        # `t`, so the receive view keeps the full fixed capacity.
+        compact_width = recv_tokens.shape[1]
         compact_tokens = recv_tokens[:, :compact_width].contiguous()
         compact_ids = recv_ids[:, :compact_width].contiguous()
         compact_weights = recv_weights[:, :compact_width].contiguous()
@@ -958,6 +981,7 @@ class NcclEpDispatcher(BaseDispatcher):
             stream=stream.cuda_stream,
         )
 
+        self._combine_link_state = (inputs, outputs)
         self._combine_intermediate_state = combined
 
     def _combine_a_rank_major(self, combine_input: NcclEpRankMajorCombineInput):
@@ -974,12 +998,15 @@ class NcclEpDispatcher(BaseDispatcher):
         # passing topk_weights here would double-apply routing weights.
         combined = self.buffer.rm_combined[: self._dispatched_t]
         stream = torch.cuda.current_stream()
+        inputs = self._nccl_ep.CombineInputs(tokens=self._nccl_ep.Tensor(pre_reduced))
+        outputs = self._nccl_ep.CombineOutputs(tokens=self._nccl_ep.Tensor(combined))
         self.handle.combine(
-            self._nccl_ep.CombineInputs(tokens=self._nccl_ep.Tensor(pre_reduced)),
-            self._nccl_ep.CombineOutputs(tokens=self._nccl_ep.Tensor(combined)),
+            inputs,
+            outputs,
             config=self._nccl_ep.CombineConfig(send_only=1),
             stream=stream.cuda_stream,
         )
+        self._combine_link_state = (inputs, outputs)
         self._combine_intermediate_state = combined
 
     def combine_b(self) -> torch.Tensor:
@@ -992,6 +1019,8 @@ class NcclEpDispatcher(BaseDispatcher):
         try:
             self.handle.complete(config=0, stream=stream.cuda_stream)
         finally:
+            self._combine_link_state = None
+            self._dispatched_topk_ids = None
             if not self._handle_persistent and self.handle is not None:
                 try:
                     self.handle.destroy()

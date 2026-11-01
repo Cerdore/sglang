@@ -783,6 +783,49 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
         )
 
 
+def validate_nccl_ep_dispatch_token_budget(server_args: Any) -> None:
+    """Check the per-rank dispatch capacity against prefill and decode batches.
+
+    NCCL EP implements only the low-latency path, so prefill chunks and decode
+    CUDA graphs both have to fit the per-rank buffer.
+    """
+    view = resolved_view(server_args)
+    if view.moe_a2a_backend != "nccl_ep":
+        return
+    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+        _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK,
+    )
+
+    capacity = (
+        view.nccl_ep_num_max_dispatch_tokens_per_rank
+        or _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK
+    )
+    if view.disaggregation_mode != "decode":
+        ceiling = max_prefill_buffer_tokens(server_args) or (
+            view.max_prefill_tokens or 0
+        )
+        scatter_ranks = max(1, view.tp_size // view.attn_dp_size)
+        prefill_tokens = -(-ceiling // scatter_ranks)
+        if prefill_tokens > capacity:
+            raise ValueError(
+                "NCCL EP per-rank prefill budget exceeds "
+                "--nccl-ep-num-max-dispatch-tokens-per-rank: "
+                f"required={prefill_tokens}, capacity={capacity}. Lower "
+                "--chunked-prefill-size / --max-prefill-tokens."
+            )
+
+    graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)
+    graph_tokens = graph_bs * tokens_per_req
+    if graph_tokens > capacity:
+        raise ValueError(
+            "NCCL EP per-rank decode CUDA graph exceeds "
+            "--nccl-ep-num-max-dispatch-tokens-per-rank: "
+            f"required={graph_tokens}, capacity={capacity} "
+            f"(requests={graph_bs}, tokens/request={tokens_per_req}). Lower "
+            "--cuda-graph-max-bs-decode."
+        )
+
+
 def validate_deepep_v2_model_architecture(server_args: Any) -> None:
     """Allow DeepEP v2 only for registered model architectures."""
 

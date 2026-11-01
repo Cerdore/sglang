@@ -8,8 +8,7 @@ Usage (on a 4-GPU node with NCCL >= 2.29):
 
     CUDA_VISIBLE_DEVICES=4,5,6,7 \
     LD_PRELOAD=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 \
-    torchrun --nproc_per_node=4 \
-        test/registered/unit/layers/moe/test_nccl_ep_synthetic.py
+    torchrun --nproc_per_node=4 test/manual/test_nccl_ep_synthetic.py
 
 Covers:
     1. NCCL EP group creation (LL, no-IB RDMA buffer init)
@@ -26,7 +25,6 @@ import os
 import sys
 import traceback
 from types import SimpleNamespace
-from typing import Optional
 
 import torch
 import torch.distributed as dist
