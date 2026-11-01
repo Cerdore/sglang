@@ -174,7 +174,6 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
-    init_nccl_ep_dispatchers,
     prebuild_deepep_v2_buffer,
     prepare_moe_topk,
 )
@@ -1060,8 +1059,6 @@ class ModelRunner:
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
-        self.init_nccl_ep_comm_resources()
-
         self.graph_shared_output = None
         # Set once real decode CUDA graphs are captured (makes on-flip role-switch
         # capture idempotent).
@@ -1100,9 +1097,6 @@ class ModelRunner:
                 else get_spec().speculative_num_draft_tokens or 0
             ),
         )
-
-    def init_nccl_ep_comm_resources(self):
-        init_nccl_ep_dispatchers(model=self.model)
 
     def post_capture_resize_kv_pool(self, *, draft_runners=()):
         resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)

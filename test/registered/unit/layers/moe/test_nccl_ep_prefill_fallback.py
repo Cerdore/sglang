@@ -580,5 +580,73 @@ class TestNcclEpTopkGuard(unittest.TestCase):
         self.assertEqual(_NCCL_EP_LL_MAX_TOPK, 9)
 
 
+class TestNcclEpHandleLifecycle(unittest.TestCase):
+    """The handle is created on first use and reused, never per-forward."""
+
+    def _make_dispatcher(self):
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            NcclEpDispatcher,
+            _Stage,
+        )
+
+        dispatcher = object.__new__(NcclEpDispatcher)
+        dispatcher._nccl_ep = MagicMock()
+        dispatcher.buffer = MagicMock()
+        dispatcher.handle = None
+        dispatcher.layout = MagicMock()
+        dispatcher.layout.is_rank_major.return_value = False
+        dispatcher.num_max_dispatch_tokens_per_rank = 1024
+        dispatcher._stage = _Stage.INITIAL
+        dispatcher._dispatch_link_state = None
+        dispatcher._combine_link_state = None
+        dispatcher._dispatched_topk_ids = None
+        dispatcher._dispatch_intermediate_state = None
+        dispatcher._combine_intermediate_state = None
+        return dispatcher
+
+    def _dispatch_once(self, dispatcher):
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import _Stage
+
+        topk_output = SimpleNamespace(
+            topk_weights=torch.ones(4, 2, dtype=torch.float32),
+            topk_ids=torch.zeros(4, 2, dtype=torch.int64),
+        )
+        with (
+            patch("torch.cuda.current_stream", return_value=MagicMock(cuda_stream=0)),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        ):
+            dispatcher.dispatch_a(torch.randn(4, 8, dtype=torch.bfloat16), topk_output)
+        # Reset the stage machine so the next dispatch_a is admissible.
+        dispatcher._stage = _Stage.INITIAL
+
+    def test_handle_created_once_then_updated(self):
+        dispatcher = self._make_dispatcher()
+
+        self._dispatch_once(dispatcher)
+        created_handle = dispatcher.handle
+        dispatcher.buffer.group.create_handle.assert_called_once()
+        created_handle.update.assert_not_called()
+
+        self._dispatch_once(dispatcher)
+        self.assertIs(dispatcher.handle, created_handle)
+        dispatcher.buffer.group.create_handle.assert_called_once()
+        created_handle.update.assert_called_once()
+
+    def test_combine_keeps_handle_alive(self):
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import _Stage
+
+        dispatcher = self._make_dispatcher()
+        dispatcher.handle = MagicMock()
+        dispatcher._combine_intermediate_state = MagicMock()
+        dispatcher._stage = _Stage.AFTER_COMBINE_A
+
+        with patch("torch.cuda.current_stream", return_value=MagicMock(cuda_stream=0)):
+            dispatcher.combine_b()
+
+        dispatcher.handle.complete.assert_called_once()
+        dispatcher.handle.destroy.assert_not_called()
+        self.assertIsNotNone(dispatcher.handle)
+
+
 if __name__ == "__main__":
     unittest.main()

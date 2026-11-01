@@ -600,8 +600,9 @@ class NcclEpDispatcher(BaseDispatcher):
         self.buffer = None
         self._comm_initialized = False
 
+        # Created on first use and retained for the process lifetime; see
+        # _ensure_handle.
         self.handle = None
-        self._handle_persistent = False
 
         # Staged execution state machine (mirrors deepep.py _Stage).
         self._stage = _Stage.INITIAL
@@ -655,29 +656,26 @@ class NcclEpDispatcher(BaseDispatcher):
             return
         self._ensure_buffer()
 
-    def init_handle_for_graph(self):
-        if self._handle_persistent:
+    def _ensure_handle(self, topk_ids: torch.Tensor, stream) -> None:
+        """Create the persistent handle on first use (eager or warmup forward).
+
+        CUDA graph capture runs the forward twice for warmup before recording,
+        so the handle and its buffers exist before capture; later forwards,
+        eager and replayed, reuse the same handle via handle.update().
+        """
+        if self.handle is not None:
             return
-        if self.layout.is_rank_major():
-            raise NotImplementedError(
-                "NCCL EP rank-major CUDA graph capture is not enabled yet; "
-                "use --disable-cuda-graph for this first implementation."
-            )
-        self.init_comm_resources()
         nccl_ep = self._nccl_ep
-        ptr = nccl_ep._ep_bindings.init_handle(
-            self.buffer.group.ptr,
-            int(
+        self.handle = self.buffer.group.create_handle(
+            layout=(
                 nccl_ep.Layout.RANK_MAJOR
                 if self.layout.is_rank_major()
                 else nccl_ep.Layout.EXPERT_MAJOR
             ),
-            0,
-            self.router_topk,
-            0,
+            topk_idx=nccl_ep.Tensor(topk_ids),
+            config=nccl_ep.HandleConfig(),
+            stream=stream.cuda_stream,
         )
-        self.handle = nccl_ep.Handle(ptr)
-        self._handle_persistent = True
 
     # ---- three-phase dispatch/combine (staged execution) ----
     def dispatch(
@@ -706,33 +704,23 @@ class NcclEpDispatcher(BaseDispatcher):
                 f"{_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP} on this backend."
             )
 
-        if self.handle is not None and not self._handle_persistent:
-            try:
-                self.handle.destroy()
-            except Exception:
-                pass
-            self.handle = None
+        if self.layout.is_rank_major() and torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "NCCL EP rank-major CUDA graph capture is not enabled yet; "
+                "use --disable-cuda-graph for this first implementation."
+            )
 
         self._ensure_buffer()
         state = self.buffer
 
         stream = torch.cuda.current_stream()
 
-        if self._handle_persistent:
+        if self.handle is None:
+            self._ensure_handle(topk_ids, stream)
+        else:
             self.handle.update(
                 topk_idx=nccl_ep.Tensor(topk_ids),
                 layout_info=None,
-                stream=stream.cuda_stream,
-            )
-        else:
-            self.handle = state.group.create_handle(
-                layout=(
-                    nccl_ep.Layout.RANK_MAJOR
-                    if self.layout.is_rank_major()
-                    else nccl_ep.Layout.EXPERT_MAJOR
-                ),
-                topk_idx=nccl_ep.Tensor(topk_ids),
-                config=nccl_ep.HandleConfig(),
                 stream=stream.cuda_stream,
             )
 
@@ -1021,10 +1009,17 @@ class NcclEpDispatcher(BaseDispatcher):
         finally:
             self._combine_link_state = None
             self._dispatched_topk_ids = None
-            if not self._handle_persistent and self.handle is not None:
-                try:
-                    self.handle.destroy()
-                except Exception:
-                    pass
-                self.handle = None
         return combined
+
+    def shutdown(self) -> None:
+        """Destroy this dispatcher's persistent handle (explicit teardown).
+
+        The handle lives for the process lifetime otherwise, like DeepEP's;
+        the process-wide group is released via NcclEpBuffer.destroy().
+        """
+        if self.handle is not None:
+            try:
+                self.handle.destroy()
+            except Exception:
+                pass
+            self.handle = None

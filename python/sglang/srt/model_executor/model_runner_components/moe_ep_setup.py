@@ -101,35 +101,6 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
             return
 
 
-def init_nccl_ep_dispatchers(*, model) -> None:
-    """Create the NCCL EP comm group and persistent handle for every MoE layer.
-
-    Must run before CUDA graph capture: capture replays a dispatch on the
-    already-created handle instead of allocating one.
-    """
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-    if not get_moe_a2a_backend().is_nccl_ep():
-        return
-
-    num_initialized = 0
-    for module in model.modules():
-        if isinstance(module, FusedMoE) and isinstance(
-            module.dispatcher, NcclEpDispatcher
-        ):
-            module.dispatcher.init_comm_resources()
-            module.dispatcher.init_handle_for_graph()
-            num_initialized += 1
-    if num_initialized == 0:
-        log_info_on_rank0(
-            logger,
-            "NCCL EP backend is selected but no MoE layer owns an "
-            "NcclEpDispatcher; comm resources were not initialized.",
-        )
-
-
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.runtime_context import get_parallel
