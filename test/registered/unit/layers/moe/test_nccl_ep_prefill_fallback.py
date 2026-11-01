@@ -55,7 +55,7 @@ class TestNcclEpStageStateMachine(unittest.TestCase):
 
         dispatcher = object.__new__(NcclEpDispatcher)
         dispatcher._stage = _Stage.INITIAL
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(RuntimeError):
             dispatcher._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
 
     def test_combine_a_before_dispatch_b_raises(self):
@@ -75,7 +75,7 @@ class TestNcclEpStageStateMachine(unittest.TestCase):
         dispatcher.hidden_size = 64
         dispatcher.num_max_dispatch_tokens_per_rank = 128
 
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(RuntimeError):
             dispatcher.combine_a(MagicMock())
 
 
@@ -646,6 +646,55 @@ class TestNcclEpHandleLifecycle(unittest.TestCase):
         dispatcher.handle.complete.assert_called_once()
         dispatcher.handle.destroy.assert_not_called()
         self.assertIsNotNone(dispatcher.handle)
+
+    def test_rejected_batch_leaves_dispatcher_usable(self):
+        """An over-capacity batch raises without advancing the stage machine,
+        so the next admissible dispatch still runs instead of a stage mismatch."""
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import _Stage
+
+        dispatcher = self._make_dispatcher()
+        dispatcher.num_max_dispatch_tokens_per_rank = 2
+        topk_output = SimpleNamespace(
+            topk_weights=torch.ones(4, 2, dtype=torch.float32),
+            topk_ids=torch.zeros(4, 2, dtype=torch.int64),
+        )
+        with self.assertRaises(ValueError):
+            dispatcher.dispatch_a(torch.randn(4, 8, dtype=torch.bfloat16), topk_output)
+        self.assertEqual(dispatcher._stage, _Stage.INITIAL)
+
+        dispatcher.num_max_dispatch_tokens_per_rank = 1024
+        self._dispatch_once(dispatcher)
+        dispatcher.buffer.group.create_handle.assert_called_once()
+
+    def test_handle_creation_refused_during_capture(self):
+        """Auto-sized handle creation is collective and may reallocate RDMA,
+        so it must never be recorded into a CUDA graph."""
+        dispatcher = self._make_dispatcher()
+        topk_ids = torch.zeros(4, 2, dtype=torch.int64)
+        with (
+            patch("torch.cuda.is_current_stream_capturing", return_value=True),
+            self.assertRaises(RuntimeError),
+        ):
+            dispatcher._ensure_handle(topk_ids, MagicMock(cuda_stream=0))
+        dispatcher.buffer.group.create_handle.assert_not_called()
+
+    def test_destroy_releases_handles_before_group(self):
+        """ncclEpHandleDestroy dereferences its group, so the group must outlive
+        every handle created on it."""
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
+        from sglang.srt.runtime_context import get_resources
+
+        order = MagicMock()
+        state = NcclEpBuffer._state()
+        state.handles = [order.handle_a, order.handle_b]
+        state.group = order.group
+        NcclEpBuffer.destroy()
+
+        self.assertEqual(
+            [c[0] for c in order.mock_calls],
+            ["handle_a.destroy", "handle_b.destroy", "group.destroy"],
+        )
+        self.assertNotIn("nccl_ep_state", get_resources().buffers)
 
 
 if __name__ == "__main__":

@@ -278,6 +278,9 @@ class NcclEpBuffer:
                 max_recv_tokens_per_rank=None,
                 router_topk=None,
                 layout=None,
+                # Every handle created on this group; destroy() must release
+                # them before the group because ncclEpHandleDestroy reads it.
+                handles=[],
                 # Pre-allocated scratch (fixed shapes); reused per dispatch/combine step.
                 recv_tokens=None,
                 expert_counters=None,
@@ -443,31 +446,6 @@ class NcclEpBuffer:
         )
 
     @staticmethod
-    def _low_latency_rdma_size_hint(nccl_ep, state, world_size: int) -> int:
-        """Worst-case RDMA buffer size for LL (explicit so handle init is local).
-
-        Prefers a nccl4py native hint; falls back to a conservative upper bound
-        from the max recv footprint (E_local * max_recv * H * 2 bytes bf16), x4
-        for send+recv+slack.
-        """
-        hint_fn = getattr(nccl_ep, "get_low_latency_rdma_size_hint", None)
-        if callable(hint_fn):
-            try:
-                return int(
-                    hint_fn(
-                        state.max_dispatch_tokens_per_rank,
-                        state.hidden_size,
-                        world_size,
-                        state.num_experts,
-                    )
-                )
-            except Exception:
-                pass  # signature mismatch; fall through to the bound below
-        per_slot = state.num_local_experts * state.max_recv_tokens_per_rank
-        per_slot *= state.hidden_size * 2  # bf16 bytes
-        return int(per_slot * 4)
-
-    @staticmethod
     def _resolve_max_num_sms(num_experts: int) -> int:
         """Cap LL EP-group SMs so overlap compute can run alongside dispatch.
 
@@ -500,14 +478,21 @@ class NcclEpBuffer:
 
     @classmethod
     def destroy(cls):
-        state = cls._state()
-        g = state.group
-        if g is not None:
-            try:
-                g.destroy()
-            except Exception:
-                pass
-            state.group = None
+        """Release every handle, then the group, and drop the scratch.
+
+        Test teardown only; serving processes release NCCL EP at exit.
+        """
+        from sglang.srt.runtime_context import get_resources
+
+        state = get_resources().buffers.pop("nccl_ep_state", None)
+        if state is None:
+            return
+        try:
+            for handle in state.handles:
+                handle.destroy()
+        finally:
+            if state.group is not None:
+                state.group.destroy()
 
 
 # ----------------------------- Dispatcher (LL path) -----------------------------
@@ -630,9 +615,12 @@ class NcclEpDispatcher(BaseDispatcher):
     # single slot — calling combine(send_only=1) before dispatch_b (complete)
     # would overwrite the dispatch continue_fn.
     def _update_stage(self, old_stage, new_stage):
-        assert self._stage == old_stage, (
-            f"NCCL EP stage mismatch: expected {old_stage}, got {self._stage}"
-        )
+        if self._stage != old_stage:
+            raise RuntimeError(
+                f"NCCL EP stage mismatch: expected {old_stage}, got {self._stage}. "
+                "A previous dispatch/combine did not complete, so the persistent "
+                "handle may hold an unfinished send_only; restart the engine."
+            )
         self._stage = new_stage
 
     def register_deepep_dispatch_hook(self, hook):
@@ -665,6 +653,13 @@ class NcclEpDispatcher(BaseDispatcher):
         """
         if self.handle is not None:
             return
+        # With auto RDMA sizing, handle creation is collective and may
+        # reallocate; nccl_ep.h forbids it inside a CUDA graph capture.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NCCL EP handle must be created by a warmup forward before CUDA "
+                "graph capture; this MoE layer was first reached during capture."
+            )
         nccl_ep = self._nccl_ep
         self.handle = self.buffer.group.create_handle(
             layout=(
@@ -676,6 +671,7 @@ class NcclEpDispatcher(BaseDispatcher):
             config=nccl_ep.HandleConfig(),
             stream=stream.cuda_stream,
         )
+        self.buffer.handles.append(self.handle)
 
     # ---- three-phase dispatch/combine (staged execution) ----
     def dispatch(
@@ -687,13 +683,8 @@ class NcclEpDispatcher(BaseDispatcher):
         return self.dispatch_b()
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-
-        nccl_ep = self._nccl_ep
-        topk_weights = topk_output.topk_weights.to(torch.float32)
-        topk_ids = topk_output.topk_ids.to(torch.int64)
-        self._dispatched_topk_ids = topk_ids
-
+        # Validate before advancing the stage so a rejected batch leaves the
+        # dispatcher usable.
         t = hidden_states.shape[0]
         if t > self.num_max_dispatch_tokens_per_rank:
             raise ValueError(
@@ -711,6 +702,12 @@ class NcclEpDispatcher(BaseDispatcher):
             )
 
         self._ensure_buffer()
+        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+
+        nccl_ep = self._nccl_ep
+        topk_weights = topk_output.topk_weights.to(torch.float32)
+        topk_ids = topk_output.topk_ids.to(torch.int64)
+        self._dispatched_topk_ids = topk_ids
         state = self.buffer
 
         stream = torch.cuda.current_stream()
@@ -1010,16 +1007,3 @@ class NcclEpDispatcher(BaseDispatcher):
             self._combine_link_state = None
             self._dispatched_topk_ids = None
         return combined
-
-    def shutdown(self) -> None:
-        """Destroy this dispatcher's persistent handle (explicit teardown).
-
-        The handle lives for the process lifetime otherwise, like DeepEP's;
-        the process-wide group is released via NcclEpBuffer.destroy().
-        """
-        if self.handle is not None:
-            try:
-                self.handle.destroy()
-            except Exception:
-                pass
-            self.handle = None

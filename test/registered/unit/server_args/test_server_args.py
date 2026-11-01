@@ -3338,6 +3338,23 @@ class TestNcclEpArgs(CustomTestCase):
                 f"expected fallback to none/deepep, got {effective}",
             )
 
+    def test_nccl_ep_rejects_two_batch_overlap(self):
+        """TBO's two in-flight sub-batches would share one group's RDMA buffer,
+        and the TBO dispatcher wrapper has no nccl_ep branch."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="nccl_ep",
+            enable_two_batch_overlap=True,
+        )
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.nccl_ep.nccl_ep_unavailable_reason",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(ValueError, "two-batch-overlap"),
+        ):
+            handle_a2a_moe(server_args)
+
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.

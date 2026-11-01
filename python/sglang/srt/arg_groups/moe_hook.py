@@ -517,6 +517,13 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_backend == "nccl_ep":
+        if cfg.enable_two_batch_overlap:
+            # The LL double-buffer index is per handle but the RDMA buffer is
+            # per group, so two in-flight sub-batches on one group would collide.
+            raise ValueError(
+                "NCCL EP MoE does not support --enable-two-batch-overlap yet. "
+                "Disable it, or use --moe-a2a-backend deepep."
+            )
         logger.warning(
             "NCCL EP MoE is enabled. The expert parallel size is adjusted to be "
             "the same as the tensor parallel size[%s]. Only the low-latency (LL) "
