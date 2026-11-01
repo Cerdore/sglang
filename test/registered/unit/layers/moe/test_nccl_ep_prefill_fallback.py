@@ -180,9 +180,60 @@ class TestNcclEpRankMajorContract(unittest.TestCase):
         self.assertEqual(
             preprocess.call_args.kwargs["output_dtype"], torch.float8_e4m3fn
         )
-        self.assertEqual(preprocess.call_args.args[0].shape, (2, 2))
-        self.assertEqual(preprocess.call_args.args[2].shape, (2, 4))
-        self.assertEqual(output.slot_shape, (1, 2))
+        self.assertEqual(preprocess.call_args.args[0].shape, (8, 2))
+        self.assertEqual(preprocess.call_args.args[2].shape, (8, 4))
+        self.assertEqual(output.slot_shape, (1, 8))
+        dispatcher._quantize_fp8.assert_not_called()
+
+    def test_rank_major_keeps_slots_beyond_local_batch(self):
+        """A source rank's contribution is bounded by its own batch, not t.
+
+        Under SUM_LEN padding, DP ranks may have unequal batches: here the
+        local rank sent 1 token while a remote rank routed 4 slots to this
+        rank's experts. Slicing the receive view to the local t would drop 3
+        valid remote slots before expert compute, while NCCL combine still
+        expects their contributions.
+        """
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
+        dispatcher = object.__new__(NcclEpDispatcher)
+        recv_ids = torch.full((2, 4, 2), -1, dtype=torch.int32)
+        recv_ids[1, 1:4, 0] = 0
+        dispatcher._dispatch_intermediate_state = (
+            torch.zeros((2, 4, 4), dtype=torch.bfloat16),
+            recv_ids,
+            torch.ones((2, 4, 2), dtype=torch.float32),
+            torch.tensor([1, 4], dtype=torch.int32),
+            1,
+        )
+        dispatcher.handle = MagicMock()
+        dispatcher.num_local_experts = 1
+        dispatcher.router_topk = 2
+        dispatcher.hidden_size = 4
+        dispatcher._dispatched_t = None
+        dispatcher._quantize_fp8 = MagicMock()
+
+        packed = torch.zeros((1, 256, 4), dtype=torch.float8_e4m3fn)
+        scales = torch.ones((1, 256, 1), dtype=torch.float32)
+        with patch("torch.cuda.current_stream", return_value=MagicMock(cuda_stream=0)):
+            with patch(
+                "sglang.kernels.ops.moe.ep_moe_kernels.moe_ep_deepgemm_preprocess",
+                return_value=(
+                    torch.tensor([3], dtype=torch.int32),
+                    3,
+                    torch.arange(8, dtype=torch.int32),
+                    packed,
+                    scales,
+                ),
+            ) as preprocess:
+                output = dispatcher._dispatch_b_rank_major()
+
+        ids_arg = preprocess.call_args.args[0]
+        self.assertEqual(ids_arg.shape, (8, 2))
+        # Rank 1's slots 1..3 map to rows 5..7 and must keep their local
+        # expert id, not the -1 padding.
+        self.assertTrue((ids_arg[5:8, 0] >= 0).all())
+        self.assertEqual(output.slot_shape, (2, 4))
         dispatcher._quantize_fp8.assert_not_called()
 
 
@@ -465,6 +516,28 @@ class TestNcclEpCapabilityCheck(unittest.TestCase):
 
         reason = nccl_ep_unavailable_reason()
         self.assertTrue(reason is None or isinstance(reason, str))
+
+    def test_missing_parent_package_degrades_to_reason(self):
+        """find_spec raises (does not return None) when the parent is missing.
+
+        The capability probe must let _nccl_ep_capability_fallback select
+        deepep/none instead of crashing during server-args configuration.
+        """
+        import importlib.util
+
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            nccl_ep_unavailable_reason,
+        )
+
+        with patch.object(
+            importlib.util,
+            "find_spec",
+            side_effect=ModuleNotFoundError("No module named 'nccl'"),
+        ):
+            self.assertEqual(
+                nccl_ep_unavailable_reason(),
+                "nccl-extensions (nccl.ep) not importable",
+            )
 
     def test_is_nccl_ep_available_returns_bool(self):
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (

@@ -967,7 +967,7 @@ class ExecMoe(msgspec.Struct):
     ] = "expert_major"
     nccl_ep_num_max_dispatch_tokens_per_rank: A[
         int,
-        "Per-rank dispatch token budget for the NCCL EP group. 0 = use the backend default (capped at 1024).",
+        "Per-rank dispatch token budget for the NCCL EP group. 0 = use the backend default (capped at 1024). Prefill and decode both use the low-latency path, so chunked-prefill-size / (tp_size / attn_dp_size) and the decode CUDA graph batch must each fit this budget.",
     ] = 0
     moe_ascend_ops_config: A[
         Optional[str],
