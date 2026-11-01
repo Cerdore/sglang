@@ -208,6 +208,7 @@ class NcclEpBuffer:
             from sglang.srt.distributed.device_communicators.pynccl import (
                 PyNcclCommunicator,
             )
+
             comm = PyNcclCommunicator(
                 group=ep_group.cpu_group,
                 device=ep_group.device,
@@ -245,11 +246,16 @@ class NcclEpBuffer:
             "NCCL EP group created (instance_id=%d, independent_comm=%s): "
             "num_experts=%d world_size=%d hidden=%d "
             "max_dispatch_tokens_per_rank=%d rdma_buffer_size=%d",
-            instance_id, instance_id != 0,
-            state.num_experts, ep_group.world_size, state.hidden_size,
-            state.max_dispatch_tokens_per_rank, rdma_buffer_size,
+            instance_id,
+            instance_id != 0,
+            state.num_experts,
+            ep_group.world_size,
+            state.hidden_size,
+            state.max_dispatch_tokens_per_rank,
+            rdma_buffer_size,
         )
         return group
+
     @staticmethod
     def _alloc_scratch(slot, state, device: torch.device):
         """Allocate fixed-shape dispatch/combine scratch once, reused across steps
@@ -263,17 +269,13 @@ class NcclEpBuffer:
         slot.recv_tokens = torch.empty(
             (e_local, max_recv, h), dtype=torch.bfloat16, device=device
         )
-        slot.expert_counters = torch.zeros(
-            (e_local,), dtype=torch.int32, device=device
-        )
+        slot.expert_counters = torch.zeros((e_local,), dtype=torch.int32, device=device)
         slot.expert_offsets = torch.zeros(
             (e_local + 1,), dtype=torch.int32, device=device
         )
         slot.recv_total = torch.zeros((1,), dtype=torch.int32, device=device)
         # Upper bound = max dispatch tokens per rank; sliced to [:t] per combine.
-        slot.combined = torch.empty(
-            (max_send, h), dtype=torch.bfloat16, device=device
-        )
+        slot.combined = torch.empty((max_send, h), dtype=torch.bfloat16, device=device)
 
     @staticmethod
     def _low_latency_rdma_size_hint(nccl_ep, state, world_size: int) -> int:
@@ -310,7 +312,10 @@ class NcclEpBuffer:
         """
         from sglang.srt.environ import envs
 
-        if envs.SGLANG_NCCL_EP_MAX_NUM_SMS.is_set() and envs.SGLANG_NCCL_EP_MAX_NUM_SMS.get() > 0:
+        if (
+            envs.SGLANG_NCCL_EP_MAX_NUM_SMS.is_set()
+            and envs.SGLANG_NCCL_EP_MAX_NUM_SMS.get() > 0
+        ):
             val = envs.SGLANG_NCCL_EP_MAX_NUM_SMS.get()
         else:
             val = 20  # conservative default for H100 (132 SMs)
@@ -414,9 +419,9 @@ class NcclEpDispatcher(BaseDispatcher):
         budget = get_nccl_ep_num_max_dispatch_tokens_per_rank()
         if budget <= 0:
             budget = _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK
-        assert (
-            budget <= _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP
-        ), f"NCCL EP max_dispatch_tokens_per_rank {budget} exceeds cap {_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP}"
+        assert budget <= _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP, (
+            f"NCCL EP max_dispatch_tokens_per_rank {budget} exceeds cap {_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP}"
+        )
         self.num_max_dispatch_tokens_per_rank = budget
 
         # Validate LL hard constraints early (fail fast at init, not at first dispatch).
@@ -518,9 +523,12 @@ class NcclEpDispatcher(BaseDispatcher):
         stream = torch.cuda.current_stream()
 
         import os as _os2
+
         _dbg2 = _os2.environ.get("NCCL_EP_TBO_DEBUG")
         if _dbg2:
-            logger.info("NCCL EP dispatch_a: before create_handle instance=%d", self.instance_id)
+            logger.info(
+                "NCCL EP dispatch_a: before create_handle instance=%d", self.instance_id
+            )
         handle = state.group.create_handle(
             layout=nccl_ep.Layout.EXPERT_MAJOR,
             topk_idx=nccl_ep.Tensor(topk_ids),
@@ -529,7 +537,10 @@ class NcclEpDispatcher(BaseDispatcher):
         )
         self.handle = handle
         if _dbg2:
-            logger.info("NCCL EP dispatch_a: after create_handle, before dispatch instance=%d", self.instance_id)
+            logger.info(
+                "NCCL EP dispatch_a: after create_handle, before dispatch instance=%d",
+                self.instance_id,
+            )
 
         # Reuse pre-allocated scratch; counters re-zeroed each dispatch.
         recv_tokens = state.recv_tokens
@@ -552,10 +563,16 @@ class NcclEpDispatcher(BaseDispatcher):
             stream=stream.cuda_stream,
         )
         import os as _os
+
         if _os.environ.get("NCCL_EP_TBO_DEBUG"):
             torch.cuda.synchronize()
-            logger.info("NCCL EP dispatch_a done: instance=%d t=%d group_id=%d slot_group_id=%d", 
-                        self.instance_id, t, id(state.group), id(self.buffer.group))
+            logger.info(
+                "NCCL EP dispatch_a done: instance=%d t=%d group_id=%d slot_group_id=%d",
+                self.instance_id,
+                t,
+                id(state.group),
+                id(self.buffer.group),
+            )
 
         self._dispatch_intermediate_state = (
             recv_tokens,
@@ -581,14 +598,19 @@ class NcclEpDispatcher(BaseDispatcher):
 
         stream = torch.cuda.current_stream()
         import os as _os
+
         _dbg = _os.environ.get("NCCL_EP_TBO_DEBUG")
         if _dbg:
             torch.cuda.synchronize()
-            logger.info("NCCL EP dispatch_b before complete: instance=%d", self.instance_id)
+            logger.info(
+                "NCCL EP dispatch_b before complete: instance=%d", self.instance_id
+            )
         self.handle.complete(config=0, stream=stream.cuda_stream)
         if _dbg:
             torch.cuda.synchronize()
-            logger.info("NCCL EP dispatch_b after complete: instance=%d", self.instance_id)
+            logger.info(
+                "NCCL EP dispatch_b after complete: instance=%d", self.instance_id
+            )
 
         if self._dispatch_output_dtype == DispatcherOutputDtype.BF16:
             dispatch_hidden_states, hidden_states_scale = recv_tokens, None
@@ -662,6 +684,7 @@ class NcclEpDispatcher(BaseDispatcher):
             stream=stream.cuda_stream,
         )
         import os as _os
+
         if _os.environ.get("NCCL_EP_TBO_DEBUG"):
             torch.cuda.synchronize()
             logger.info("NCCL EP combine_a done: instance=%d", self.instance_id)
@@ -676,16 +699,23 @@ class NcclEpDispatcher(BaseDispatcher):
 
         stream = torch.cuda.current_stream()
         import os as _os
+
         _dbg = _os.environ.get("NCCL_EP_TBO_DEBUG")
         if _dbg:
             torch.cuda.synchronize()
-            logger.info("NCCL EP combine_b before complete: instance=%d", self.instance_id)
+            logger.info(
+                "NCCL EP combine_b before complete: instance=%d", self.instance_id
+            )
         self.handle.complete(config=0, stream=stream.cuda_stream)
         if _dbg:
             torch.cuda.synchronize()
-            logger.info("NCCL EP combine_b after complete: instance=%d", self.instance_id)
+            logger.info(
+                "NCCL EP combine_b after complete: instance=%d", self.instance_id
+            )
         self.handle.destroy()
         self.handle = None
         if _dbg:
-            logger.info("NCCL EP combine_b destroyed handle: instance=%d", self.instance_id)
+            logger.info(
+                "NCCL EP combine_b destroyed handle: instance=%d", self.instance_id
+            )
         return combined

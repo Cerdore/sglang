@@ -292,14 +292,14 @@ class NcclEpBuffer:
     @classmethod
     def get_buffer(
         cls,
-        ep_group: "GroupCoordinator",
+        ep_group: GroupCoordinator,
         hidden_size: int,
         num_experts: int,
         num_local_experts: int,
         max_dispatch_tokens_per_rank: int,
         router_topk: int,
         layout,
-    ) -> "NcclEpBuffer":
+    ) -> NcclEpBuffer:
         state = cls._state()
         if state.group is None:
             state.num_experts = num_experts
@@ -336,7 +336,7 @@ class NcclEpBuffer:
         return state
 
     @classmethod
-    def _create_group(cls, state, ep_group: "GroupCoordinator"):
+    def _create_group(cls, state, ep_group: GroupCoordinator):
         nccl_core, nccl_ep = _load_nccl_ep()
 
         pynccl = ep_group.pynccl_comm
@@ -520,9 +520,7 @@ class NcclEpDispatcher(BaseDispatcher):
     after dispatch to feed ``apply_deepep_ll``.
     """
 
-    def __init__(
-        self, moe_runner_config: "MoeRunnerConfig", ep_group: "GroupCoordinator"
-    ):
+    def __init__(self, moe_runner_config: MoeRunnerConfig, ep_group: GroupCoordinator):
         super().__init__()
         nccl_core, nccl_ep = _load_nccl_ep()
         self._nccl_ep = nccl_ep
